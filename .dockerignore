@@ -1,0 +1,21 @@
+# Version control and editor
+.git/
+.gitignore
+.dockerignore
+.editorconfig
+.vscode/
+.idea/
+
+# Documentation
+README.md
+
+# Build artifacts
+*.o
+*.so
+*.a
+*.bc
+
+# Temporary and log files
+*.tmp
+*.log
+*~

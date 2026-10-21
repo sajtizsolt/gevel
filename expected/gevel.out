@@ -1,0 +1,448 @@
+-- ================================================================
+-- Gevel Extension Regression Test Suite
+-- ================================================================
+SET extra_float_digits = 0;
+CREATE EXTENSION gevel;
+-- ================================================================
+-- 1. GiST Index Inspection
+-- ================================================================
+CREATE TABLE test_gist (id int, b box);
+INSERT INTO test_gist VALUES 
+  (1, box(point(0,0), point(1,1))),
+  (2, box(point(2,2), point(3,3)));
+CREATE INDEX idx_test_gist ON test_gist USING gist(b);
+SELECT gist_stat('idx_test_gist');
+               gist_stat               
+---------------------------------------
+ Number of levels:          1         +
+ Number of pages:           1         +
+ Number of leaf pages:      1         +
+ Number of tuples:          2         +
+ Number of invalid tuples:  0         +
+ Number of leaf tuples:     2         +
+ Total size of tuples:      100 bytes +
+ Total size of leaf tuples: 100 bytes +
+ Total size of index:       8192 bytes+
+ 
+(1 row)
+
+SELECT gist_tree('idx_test_gist');
+                                       gist_tree                                        
+----------------------------------------------------------------------------------------
+ 0(l:0) blk: 0 numTuple: 2 free: 8060b(1.23%) rightlink:4294967295 (InvalidBlockNumber)+
+ 
+(1 row)
+
+SELECT gist_tree('idx_test_gist', 1);
+                                       gist_tree                                        
+----------------------------------------------------------------------------------------
+ 0(l:0) blk: 0 numTuple: 2 free: 8060b(1.23%) rightlink:4294967295 (InvalidBlockNumber)+
+ 
+(1 row)
+
+SELECT * FROM gist_print('idx_test_gist') AS t(level int, valid bool, b box)
+  ORDER BY b::text;
+ level | valid |      b      
+-------+-------+-------------
+     1 | t     | (1,1),(0,0)
+     1 | t     | (3,3),(2,2)
+(2 rows)
+
+-- ================================================================
+-- 2. B-Tree Index Inspection (Multi-Column & Covering INCLUDE)
+-- ================================================================
+CREATE TABLE test_btree (id int, val text);
+INSERT INTO test_btree VALUES 
+  (1, 'apple'),
+  (2, 'banana'),
+  (3, 'cherry');
+CREATE INDEX idx_test_btree ON test_btree USING btree(id, val);
+SELECT btree_stat('idx_test_btree');
+              btree_stat               
+---------------------------------------
+ Number of levels:          1         +
+ Number of pages:           1         +
+ Number of leaf pages:      1         +
+ Number of tuples:          3         +
+ Number of invalid tuples:  0         +
+ Number of leaf tuples:     3         +
+ Total size of tuples:      128 bytes +
+ Total size of leaf tuples: 128 bytes +
+ Total size of index:       8192 bytes+
+ 
+(1 row)
+
+SELECT btree_tree('idx_test_btree');
+          btree_tree          
+------------------------------
+ lvl: 0, blk: 1, numTuples: 3+
+ 
+(1 row)
+
+SELECT btree_tree('idx_test_btree', 1);
+          btree_tree          
+------------------------------
+ lvl: 0, blk: 1, numTuples: 3+
+ 
+(1 row)
+
+SELECT * FROM btree_print('idx_test_btree') AS t(level int, valid bool, id int, val text)
+  ORDER BY level, id;
+ level | valid | id |  val   
+-------+-------+----+--------
+     1 | t     |  1 | apple
+     1 | t     |  2 | banana
+     1 | t     |  3 | cherry
+(3 rows)
+
+-- Covering index with non-key INCLUDE column
+CREATE TABLE test_btree_inc (id int, payload text);
+INSERT INTO test_btree_inc VALUES 
+  (1, 'alpha'),
+  (2, 'beta');
+CREATE INDEX idx_test_btree_inc ON test_btree_inc (id) INCLUDE (payload);
+SELECT btree_stat('idx_test_btree_inc');
+              btree_stat               
+---------------------------------------
+ Number of levels:          1         +
+ Number of pages:           1         +
+ Number of leaf pages:      1         +
+ Number of tuples:          2         +
+ Number of invalid tuples:  0         +
+ Number of leaf tuples:     2         +
+ Total size of tuples:      100 bytes +
+ Total size of leaf tuples: 100 bytes +
+ Total size of index:       8192 bytes+
+ 
+(1 row)
+
+SELECT * FROM btree_print('idx_test_btree_inc') AS t(level int, valid bool, id int, payload text)
+  ORDER BY level, id;
+ level | valid | id | payload 
+-------+-------+----+---------
+     1 | t     |  1 | alpha
+     1 | t     |  2 | beta
+(2 rows)
+
+-- ================================================================
+-- 3. GIN Index Inspection (Single & Multi-Column)
+-- ================================================================
+CREATE TABLE test_gin (doc tsvector, arr int[]);
+INSERT INTO test_gin VALUES 
+  (to_tsvector('english', 'postgresql index inspection'), ARRAY[10, 20]);
+CREATE INDEX idx_test_gin_ts ON test_gin USING gin(doc);
+CREATE INDEX idx_test_gin_arr ON test_gin USING gin(arr);
+SELECT gin_statpage('idx_test_gin_ts');
+        gin_statpage         
+-----------------------------
+ totalPages:            1   +
+ deletedPages:          0   +
+ emptyDataPages:        0   +
+ dataPages:             0   +
+ dataInnerPages:        0   +
+ dataLeafPages:         0   +
+ dataInnerFreeSpace:    0   +
+ dataLeafFreeSpace:     0   +
+ dataInnerTuplesCount:  0   +
+ dataLeafIptrsCount:    0   +
+ entryPages:            1   +
+ entryInnerPages:       0   +
+ entryLeafPages:        1   +
+ entryInnerFreeSpace:   0   +
+ entryLeafFreeSpace:    8068+
+ entryInnerTuplesCount: 0   +
+ entryLeafTuplesCount:  3   +
+ entryPostingSize:      24  +
+ entryPostingCount:     3   +
+ entryAttrSize:         32  +
+ 
+(1 row)
+
+SELECT * FROM gin_stat('idx_test_gin_arr') AS t(val int, nrow int)
+  ORDER BY val;
+ val | nrow 
+-----+------
+  10 |    1
+  20 |    1
+(2 rows)
+
+SELECT gin_count_estimate('idx_test_gin_ts', to_tsquery('english', 'postgresql'));
+ gin_count_estimate 
+--------------------
+                  1
+(1 row)
+
+-- Multi-column GIN index with column offset
+CREATE TABLE test_gin_multi (doc tsvector, arr int[]);
+INSERT INTO test_gin_multi VALUES 
+  (to_tsvector('english', 'multi column gin'), ARRAY[1, 2]);
+CREATE INDEX idx_test_gin_multi ON test_gin_multi USING gin(doc, arr);
+SELECT * FROM gin_stat('idx_test_gin_multi', 0) AS t(val text, nrow int)
+  ORDER BY val;
+  val   | nrow 
+--------+------
+ column |    1
+ gin    |    1
+ multi  |    1
+(3 rows)
+
+SELECT * FROM gin_stat('idx_test_gin_multi', 1) AS t(val int, nrow int)
+  ORDER BY val;
+ val | nrow 
+-----+------
+   1 |    1
+   2 |    1
+(2 rows)
+
+-- ================================================================
+-- 4. SP-GiST Index Inspection (2D Points)
+-- ================================================================
+CREATE TABLE test_spgist (p point);
+INSERT INTO test_spgist VALUES (point(1,1)), (point(2,2));
+CREATE INDEX idx_test_spgist ON test_spgist USING spgist(p);
+SELECT spgist_stat('idx_test_spgist');
+           spgist_stat            
+----------------------------------
+ totalPages:         2           +
+ deletedPages:       0           +
+ innerPages:         0           +
+ leafPages:          2           +
+ emptyPages:         1           +
+ usedSpace:          0.07 kbytes +
+ usedInnerSpace:     0.00 kbytes +
+ usedLeafSpace:      0.07 kbytes +
+ freeSpace:          15.87 kbytes+
+ fillRatio:          0.44%       +
+ leafTuples:         2           +
+ innerTuples:        0           +
+ innerAllTheSame:    0           +
+ leafPlaceholders:   0           +
+ innerPlaceholders:  0           +
+ leafRedirects:      0           +
+ innerRedirects:     0
+(1 row)
+
+SELECT * FROM spgist_print('idx_test_spgist')
+  AS t(tid tid, allthesame bool, node int, level int, tid_pointer tid, prefix point, label int, leaf point)
+  ORDER BY tid;
+  tid  | allthesame | node | level | tid_pointer | prefix | label | leaf  
+-------+------------+------+-------+-------------+--------+-------+-------
+ (1,1) |            |      |     1 |             |        |       | (1,1)
+(1 row)
+
+-- ================================================================
+-- 5. BRIN Index Inspection
+-- ================================================================
+CREATE TABLE test_brin (id int);
+INSERT INTO test_brin SELECT generate_series(1, 100);
+CREATE INDEX idx_test_brin ON test_brin USING brin(id);
+SELECT brin_stat('idx_test_brin');
+                 brin_stat                 
+-------------------------------------------
+ Number of revmap pages:        1         +
+ Number of empty revmap pages:  0         +
+ Number of regular pages:       1         +
+ Number of tuples:              1         +
+ Used space:                    80 bytes  +
+ Free space:                    8136 bytes+
+ 
+(1 row)
+
+SELECT brin_print('idx_test_brin');
+               brin_print               
+----------------------------------------
+ Start block: 0; end block: 0          +
+ Heap block: 0; offset: 100, free: 4564+
+ 
+(1 row)
+
+-- ================================================================
+-- 6. Empty Index Handling Across All Access Methods
+-- ================================================================
+CREATE TABLE test_empty (id int, b box, p point, arr int[]);
+CREATE INDEX idx_empty_gist ON test_empty USING gist(b);
+CREATE INDEX idx_empty_btree ON test_empty USING btree(id);
+CREATE INDEX idx_empty_gin ON test_empty USING gin(arr);
+CREATE INDEX idx_empty_spgist ON test_empty USING spgist(p);
+CREATE INDEX idx_empty_brin ON test_empty USING brin(id);
+SELECT gist_stat('idx_empty_gist');
+               gist_stat               
+---------------------------------------
+ Number of levels:          1         +
+ Number of pages:           1         +
+ Number of leaf pages:      1         +
+ Number of tuples:          0         +
+ Number of invalid tuples:  0         +
+ Number of leaf tuples:     0         +
+ Total size of tuples:      12 bytes  +
+ Total size of leaf tuples: 12 bytes  +
+ Total size of index:       8192 bytes+
+ 
+(1 row)
+
+SELECT gist_tree('idx_empty_gist');
+                                       gist_tree                                        
+----------------------------------------------------------------------------------------
+ 0(l:0) blk: 0 numTuple: 0 free: 8148b(0.15%) rightlink:4294967295 (InvalidBlockNumber)+
+ 
+(1 row)
+
+SELECT * FROM gist_print('idx_empty_gist') AS t(level int, valid bool, b box);
+ level | valid | b 
+-------+-------+---
+(0 rows)
+
+SELECT btree_stat('idx_empty_btree');
+             btree_stat             
+------------------------------------
+ Number of levels:          0      +
+ Number of pages:           0      +
+ Number of leaf pages:      0      +
+ Number of tuples:          0      +
+ Number of invalid tuples:  0      +
+ Number of leaf tuples:     0      +
+ Total size of tuples:      0 bytes+
+ Total size of leaf tuples: 0 bytes+
+ Total size of index:       0 bytes+
+ 
+(1 row)
+
+SELECT btree_tree('idx_empty_btree');
+ btree_tree 
+------------
+ 
+(1 row)
+
+SELECT * FROM btree_print('idx_empty_btree') AS t(level int, valid bool, id int);
+ level | valid | id 
+-------+-------+----
+(0 rows)
+
+SELECT gin_statpage('idx_empty_gin');
+        gin_statpage         
+-----------------------------
+ totalPages:            1   +
+ deletedPages:          0   +
+ emptyDataPages:        0   +
+ dataPages:             0   +
+ dataInnerPages:        0   +
+ dataLeafPages:         0   +
+ dataInnerFreeSpace:    0   +
+ dataLeafFreeSpace:     0   +
+ dataInnerTuplesCount:  0   +
+ dataLeafIptrsCount:    0   +
+ entryPages:            1   +
+ entryInnerPages:       0   +
+ entryLeafPages:        1   +
+ entryInnerFreeSpace:   0   +
+ entryLeafFreeSpace:    8160+
+ entryInnerTuplesCount: 0   +
+ entryLeafTuplesCount:  0   +
+ entryPostingSize:      0   +
+ entryPostingCount:     0   +
+ entryAttrSize:         0   +
+ 
+(1 row)
+
+SELECT * FROM gin_stat('idx_empty_gin') AS t(val int, nrow int);
+ val | nrow 
+-----+------
+(0 rows)
+
+SELECT spgist_stat('idx_empty_spgist');
+           spgist_stat            
+----------------------------------
+ totalPages:         2           +
+ deletedPages:       0           +
+ innerPages:         0           +
+ leafPages:          2           +
+ emptyPages:         2           +
+ usedSpace:          0.00 kbytes +
+ usedInnerSpace:     0.00 kbytes +
+ usedLeafSpace:      0.00 kbytes +
+ freeSpace:          15.94 kbytes+
+ fillRatio:          0.00%       +
+ leafTuples:         0           +
+ innerTuples:        0           +
+ innerAllTheSame:    0           +
+ leafPlaceholders:   0           +
+ innerPlaceholders:  0           +
+ leafRedirects:      0           +
+ innerRedirects:     0
+(1 row)
+
+SELECT * FROM spgist_print('idx_empty_spgist')
+  AS t(tid tid, allthesame bool, node int, level int, tid_pointer tid, prefix point, label int, leaf point);
+ tid | allthesame | node | level | tid_pointer | prefix | label | leaf 
+-----+------------+------+-------+-------------+--------+-------+------
+(0 rows)
+
+SELECT brin_stat('idx_empty_brin');
+               brin_stat                
+----------------------------------------
+ Number of revmap pages:        0      +
+ Number of empty revmap pages:  0      +
+ Number of regular pages:       0      +
+ Number of tuples:              0      +
+ Used space:                    0 bytes+
+ Free space:                    0 bytes+
+ 
+(1 row)
+
+SELECT brin_print('idx_empty_brin');
+ brin_print 
+------------
+ 
+(1 row)
+
+-- ================================================================
+-- 7. Defensive Error Handling & Guidance
+-- ================================================================
+-- Non-existent index
+DO $$
+BEGIN
+  PERFORM btree_stat('non_existent_index');
+EXCEPTION WHEN OTHERS THEN
+  RAISE NOTICE 'Handled error: %', SQLERRM;
+END $$;
+NOTICE:  Handled error: relation "non_existent_index" does not exist
+-- Wrong access method
+DO $$
+BEGIN
+  PERFORM btree_stat('idx_test_gist');
+EXCEPTION WHEN OTHERS THEN
+  RAISE NOTICE 'Handled error: %', SQLERRM;
+END $$;
+NOTICE:  Handled error: Index public.idx_test_gist has wrong type
+-- Non-index relation (table instead of index)
+DO $$
+BEGIN
+  PERFORM btree_stat('test_btree');
+EXCEPTION WHEN OTHERS THEN
+  RAISE NOTICE 'Handled error: %', SQLERRM;
+END $$;
+NOTICE:  Handled error: "test_btree" is not an index
+-- Partitioned index guidance
+CREATE TABLE test_part (id int) PARTITION BY RANGE (id);
+CREATE TABLE test_part_1 PARTITION OF test_part FOR VALUES FROM (1) TO (100);
+CREATE INDEX idx_test_part ON test_part (id);
+DO $$
+BEGIN
+  PERFORM btree_stat('idx_test_part');
+EXCEPTION WHEN OTHERS THEN
+  RAISE NOTICE 'Handled error: %', SQLERRM;
+END $$;
+NOTICE:  Handled error: "idx_test_part" is a partitioned index; inspect individual partition indexes instead
+-- Invalid column number for gin_stat
+DO $$
+BEGIN
+  PERFORM * FROM gin_stat('idx_test_gin_arr', 99) AS t(val int, nrow int);
+EXCEPTION WHEN OTHERS THEN
+  RAISE NOTICE 'Handled error: %', SQLERRM;
+END $$;
+NOTICE:  Handled error: Wrong column's number
+-- ================================================================
+-- 8. Teardown
+-- ================================================================
+DROP TABLE test_gist, test_btree, test_btree_inc, test_gin, test_gin_multi, test_spgist, test_brin, test_empty, test_part;
+DROP EXTENSION gevel;
