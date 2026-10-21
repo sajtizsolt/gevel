@@ -1,42 +1,82 @@
 # gevel
 
-This is a clone of the [original](http://www.sigaev.ru/git/gitweb.cgi?p=gevel.git;a=summary) *gevel* implementation by *Teodor Sigaev*.
-I've changed some of the files to make it compatible with PostgreSQL v14.2.
+`gevel` is a PostgreSQL extension for inspecting and visualizing index internal structures (GiST, GIN, SP-GiST, B-Tree, and BRIN).
 
-## How to install
+This is a fork of the [original](http://www.sigaev.ru/git/gitweb.cgi?p=gevel.git;a=summary) *gevel* implementation by *Teodor Sigaev*, modernized to support PostgreSQL 12–18.
 
-If you have installed PostgreSQL by your package manager then it is likely that you don't have to edit the script, but maybe you should change the following paths:
+## Quick Start (Docker)
 
-- `POSTGRESQL_INCLUDE_DIRECTORY`: the directory of the precompiled PostgreSQL header and source files
-- `POSTGRESQL_EXTENSION_DIRECTORY`: the directory where your extensions live (should contain subdirectories like *btree_gist, cube, etc.*)
-- `POSTGRESQL_LIBRARY_DIRECTORY`: the directory where the shared libraries and objects (maybe with the same filenames as in the extension directory)
-
-Then run the script:
-
-```shell
-$ sudo ./install.sh
+```bash
+docker build -t gevel .
+docker run --name gevel-test -e POSTGRES_PASSWORD=postgres -p 5432:5432 -d gevel
+docker exec -it gevel-test psql -U postgres -c "CREATE EXTENSION gevel;"
+docker exec -it gevel-test psql -U postgres
 ```
 
-## How to use
+## Install to an Existing Database
 
-You have to create the extension and then check if it works.
+Build and install using PGXS:
 
-```pgsql
-DROP EXTENSION IF EXISTS gevel;
+```bash
+make
+sudo make install
+```
+
+If `pg_config` is not in your `PATH`, specify it explicitly:
+
+```bash
+make PG_CONFIG=/path/to/pg_config
+sudo make install PG_CONFIG=/path/to/pg_config
+```
+
+Then enable in your database:
+
+```sql
 CREATE EXTENSION gevel;
-SELECT gist_print('name_of_your_gist_index');
 ```
 
-### Try with Docker
+## Usage Examples
 
-Build an image from the Dockerfile and assign it a name.
-
-```shell
-$ docker build -t eg_postgresql .
+### GiST
+```sql
+SELECT gist_stat('my_gist_idx');
+SELECT gist_tree('my_gist_idx', 2);
+SELECT * FROM gist_print('my_gist_idx') AS t(level int, valid bool, box box);
 ```
 
-Run the PostgreSQL server container (in the foreground):
+### B-Tree
+```sql
+SELECT btree_stat('my_btree_idx');
+SELECT btree_tree('my_btree_idx', 2);
+SELECT * FROM btree_print('my_btree_idx') AS t(level int, valid bool, val int);
+```
 
-```shell
-$ docker run --rm -P --name pg_test eg_postgresql
+### GIN
+```sql
+SELECT gin_statpage('my_gin_idx');
+SELECT * FROM gin_stat('my_gin_idx') AS t(value text, nrow int);
+SELECT gin_count_estimate('my_gin_idx', to_tsquery('english', 'query'));
+```
+
+### SP-GiST
+```sql
+SELECT spgist_stat('my_spgist_idx');
+SELECT * FROM spgist_print('my_spgist_idx')
+  AS t(tid tid, allthesame bool, node int, level int, tid_pointer tid, prefix point, label int, leaf point);
+```
+
+### BRIN
+```sql
+SELECT brin_stat('my_brin_idx');
+SELECT brin_print('my_brin_idx');
+```
+
+## Uninstall
+
+```sql
+DROP EXTENSION gevel;
+```
+
+```bash
+sudo make uninstall
 ```

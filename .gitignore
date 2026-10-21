@@ -1,6 +1,23 @@
-# C
+# Build artifacts
 *.o
 *.so
+*.a
+*.bc
+*.dylib
+*.dll
 
-# Visual Studio Code
+# PostgreSQL regression test artifacts
+results/
+regression.diffs
+regression.out
+tmp_check/
+
+# Editor and IDE
 .vscode/
+.idea/
+*.swp
+*~
+
+# OS artifacts
+.DS_Store
+Thumbs.db

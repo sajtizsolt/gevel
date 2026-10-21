@@ -49,6 +49,9 @@
 #endif
 
 
+#ifdef PAGESIZE
+#undef PAGESIZE
+#endif
 #define PAGESIZE	(BLCKSZ - MAXALIGN(sizeof(PageHeaderData) + sizeof(ItemIdData)))
 
 #ifndef PG_NARGS
@@ -180,7 +183,9 @@ btree_index_close(Relation rel) {
 
 #endif
 
-#if PG_VERSION_NUM >= 80300
+#if PG_VERSION_NUM >= 160000
+#define stringToQualifiedNameList(x,y)	stringToQualifiedNameList(x, NULL)
+#elif PG_VERSION_NUM >= 80300
 #define stringToQualifiedNameList(x,y)	stringToQualifiedNameList(x)
 #endif
 
@@ -449,7 +454,9 @@ closeGPPage( FuncCallContext *funcctx ) {
 	return ( (TypeStorage*)(funcctx->user_fctx) )->item;
 }
 
-#if PG_VERSION_NUM >= 110000
+#if PG_VERSION_NUM >= 170000
+#define TS_GET_TYPEVAL(s, i, v)	TupleDescAttr((s)->index->rd_att, (i))->v
+#elif PG_VERSION_NUM >= 110000
 #define TS_GET_TYPEVAL(s, i, v)	(s)->index->rd_att->attrs[(i)].v
 #else
 #define TS_GET_TYPEVAL(s, i, v)	(s)->index->rd_att->attrs[(i)]->v
@@ -811,11 +818,11 @@ processTuple( FuncCallContext  *funcctx,  GinStatState *st, IndexTuple itup ) {
 
 		LockBuffer(st->buffer, GIN_UNLOCK);
 #if PG_VERSION_NUM >= 90400
-		stack = ginScanBeginPostingTree(&btree, st->index, rootblkno
-#if PG_VERSION_NUM >= 90600
-										, NULL
+#if PG_VERSION_NUM >= 90600 && PG_VERSION_NUM < 140000
+		stack = ginScanBeginPostingTree(&btree, st->index, rootblkno, NULL);
+#else
+		stack = ginScanBeginPostingTree(&btree, st->index, rootblkno);
 #endif
-										);
 		page = BufferGetPage(stack->buffer);
 		ItemPointerSetMin(&minItem);
 		list = GinDataLeafPageGetItems(page, &nlist, minItem);
@@ -950,7 +957,9 @@ gin_count_estimate(PG_FUNCTION_ARGS) {
 	fmgr_info( F_TS_MATCH_VQ , &key.sk_func );
 
 #if PG_VERSION_NUM >= 90100
-#if PG_VERSION_NUM >= 90400
+#if PG_VERSION_NUM >= 180000
+	scan = index_beginscan_bitmap(index, SnapshotSelf, NULL, 1);
+#elif PG_VERSION_NUM >= 90400
 	scan = index_beginscan_bitmap(index, SnapshotSelf, 1);
 #else
 	scan = index_beginscan_bitmap(index, SnapshotNow, 1);
@@ -995,7 +1004,7 @@ spgist_stat(PG_FUNCTION_ARGS)
 #if PG_VERSION_NUM < 90200
 	elog(NOTICE, "Function is not working under PgSQL < 9.2");
 
-	PG_RETURN_TEXT_P(CStringGetTextDatum("???"));
+	PG_RETURN_DATUM(CStringGetTextDatum("???"));
 #else
 	text	   *name = PG_GETARG_TEXT_P(0);
 	RangeVar   *relvar;
@@ -1128,7 +1137,7 @@ spgist_stat(PG_FUNCTION_ARGS)
 			 nLeafPlaceholder, nInnerPlaceholder,
 			 nLeafRedirect, nInnerRedirect);
 
-	PG_RETURN_TEXT_P(CStringGetTextDatum(res));
+	PG_RETURN_DATUM(CStringGetTextDatum(res));
 #endif
 }
 
@@ -1182,7 +1191,7 @@ spgist_print(PG_FUNCTION_ARGS)
 #if PG_VERSION_NUM < 90200
 	elog(NOTICE, "Function is not working under PgSQL < 9.2");
 
-	PG_RETURN_TEXT_P(CStringGetTextDatum("???"));
+	PG_RETURN_DATUM(CStringGetTextDatum("???"));
 #else
 	FuncCallContext			*funcctx;
 	SPGistPrint				*prst;
@@ -1385,7 +1394,7 @@ gin_statpage(PG_FUNCTION_ARGS)
 #if PG_VERSION_NUM < 90400
 	elog(NOTICE, "Function is not working under PgSQL < 9.4");
 
-	PG_RETURN_TEXT_P(CStringGetTextDatum("???"));
+	PG_RETURN_DATUM(CStringGetTextDatum("???"));
 #else
 	text	   *name = PG_GETARG_TEXT_P(0);
 	RangeVar   *relvar;
@@ -1569,7 +1578,7 @@ gin_statpage(PG_FUNCTION_ARGS)
 			 entryAttrSize
 			 );
 
-	PG_RETURN_TEXT_P(CStringGetTextDatum(res));
+	PG_RETURN_DATUM(CStringGetTextDatum(res));
 #endif
 }
 
@@ -1608,7 +1617,7 @@ btree_deep_search(Relation rel, int level,
 		case stat:
 		{
 			btreeIdxInfo->idxStat.numpages++;
-			btreeIdxInfo->idxStat.tuplesize+=BTMaxItemSize(page)-PageGetFreeSpace(page);
+			btreeIdxInfo->idxStat.tuplesize+=(BLCKSZ - PageGetFreeSpace(page));
 			btreeIdxInfo->idxStat.totalsize+=BLCKSZ;
 			btreeIdxInfo->idxStat.numtuple+=maxoff;
 
@@ -1618,8 +1627,7 @@ btree_deep_search(Relation rel, int level,
 			if (P_ISLEAF(opaque))
 			{
 				btreeIdxInfo->idxStat.numleafpages++;
-				btreeIdxInfo->idxStat.leaftuplesize+=BTMaxItemSize(page)-
-						PageGetFreeSpace(page);
+				btreeIdxInfo->idxStat.leaftuplesize+=(BLCKSZ - PageGetFreeSpace(page));
 				btreeIdxInfo->idxStat.numleaftuple+=maxoff;
 			}
 			break;
@@ -2044,7 +2052,11 @@ brin_stat(PG_FUNCTION_ARGS)
 	relvar = makeRangeVarFromNameList(relname_list);
 	index = brin_index_open(relvar);
 
+#if PG_VERSION_NUM >= 140000
+	revmap = brinRevmapInitialize(index, &pagesPerRange);
+#else
 	revmap = brinRevmapInitialize(index, &pagesPerRange, NULL);
+#endif
 	heapRel = table_open(IndexGetRelation(RelationGetRelid(index), false),
 								 AccessShareLock);
 	/* Determine range of pages to process */
@@ -2065,8 +2077,13 @@ brin_stat(PG_FUNCTION_ARGS)
 
 		numRevmapPages++;
 		/* Get on-disk tuple */
+#if PG_VERSION_NUM >= 140000
+		tup = brinGetTupleForHeapBlock(revmap, startBlk, &buf, &off, NULL,
+				   BUFFER_LOCK_SHARE);
+#else
 		tup = brinGetTupleForHeapBlock(revmap, startBlk, &buf, &off, NULL,
 				   BUFFER_LOCK_SHARE, NULL);
+#endif
 
 		if (tup)
 		{
@@ -2147,7 +2164,11 @@ brin_print(PG_FUNCTION_ARGS)
 	/* Determine range of pages to process */
 	numBlocks = RelationGetNumberOfBlocks(heapRel);
 	table_close(heapRel, AccessShareLock);
+#if PG_VERSION_NUM >= 140000
+	revmap = brinRevmapInitialize(index, &pagesPerRange);
+#else
 	revmap = brinRevmapInitialize(index, &pagesPerRange, NULL);
+#endif
 
 	for(heapBlk = 0; heapBlk < numBlocks; heapBlk += pagesPerRange)
 	{
