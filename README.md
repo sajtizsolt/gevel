@@ -35,6 +35,14 @@ Then enable in your database:
 CREATE EXTENSION gevel;
 ```
 
+## Running Tests
+
+Run the regression tests against a running PostgreSQL server:
+
+```bash
+make installcheck
+```
+
 ## Usage Examples
 
 ### GiST

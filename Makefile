@@ -2,6 +2,7 @@ MODULES = gevel
 EXTENSION = gevel
 DATA = gevel--1.0.sql
 PGFILEDESC = "gevel - index inspection extension"
+REGRESS = gevel
 
 # Disable LLVM bitcode generation so clang is not required
 override with_llvm = no

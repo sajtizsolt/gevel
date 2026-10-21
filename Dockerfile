@@ -2,6 +2,8 @@ FROM postgres:18-alpine
 
 WORKDIR /tmp/gevel
 COPY Makefile gevel.c gevel.control gevel--1.0.sql ./
+COPY sql/ ./sql/
+COPY expected/ ./expected/
 
 RUN apk add --no-cache gcc musl-dev make && \
     make && make install && \
