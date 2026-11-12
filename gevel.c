@@ -1,6 +1,7 @@
 #include "postgres.h"
 
 #include "access/genam.h"
+#include "access/xact.h"
 #include "access/gin.h"
 #if PG_VERSION_NUM >= 90400
 #include "utils/snapmgr.h"
@@ -15,6 +16,9 @@
 #include "access/spgist_private.h"
 #include "access/spgist.h"
 #include "utils/datum.h"
+#ifndef SGLT_GET_NEXTOFFSET
+#define SGLT_GET_NEXTOFFSET(tup) ((tup)->nextOffset)
+#endif
 #endif
 #include "access/heapam.h"
 #include "catalog/index.h"
@@ -37,6 +41,7 @@
 #include "utils/fmgroids.h"
 #include <fmgr.h>
 #include <funcapi.h>
+#include "utils/memutils.h"
 #include <access/heapam.h>
 #include <catalog/pg_type.h>
 #include <access/relscan.h>
@@ -46,6 +51,17 @@
 #include <access/brin_revmap.h>
 #include <access/brin_page.h>
 #include <access/brin_tuple.h>
+
+#if PG_VERSION_NUM >= 170000
+#define GEVEL_BRIN_REVMAP_INIT(index, ppr) brinRevmapInitialize(index, ppr)
+#define GEVEL_BRIN_GET_TUPLE(revmap, blk, pbuf, poff, psize, lock) \
+	brinGetTupleForHeapBlock(revmap, blk, pbuf, poff, psize, lock)
+#else
+#define GEVEL_BRIN_REVMAP_INIT(index, ppr) brinRevmapInitialize(index, ppr, NULL)
+#define GEVEL_BRIN_GET_TUPLE(revmap, blk, pbuf, poff, psize, lock) \
+	brinGetTupleForHeapBlock(revmap, blk, pbuf, poff, psize, lock, NULL)
+#endif
+
 #endif
 
 
@@ -66,6 +82,22 @@
 #define ISNULL		'n'
 #define ISNOTNULL	' '
 #endif
+
+#if PG_VERSION_NUM >= 110000
+#define INDEX_GET_ATTR(r, i)	TupleDescAttr((r)->rd_att, (i))
+#else
+#define INDEX_GET_ATTR(r, i)	((r)->rd_att->attrs[(i)])
+#endif
+
+static Datum
+safe_index_datum(Datum val, Form_pg_attribute att)
+{
+	if (att->attbyval)
+		return val;
+	if (att->attlen == -1)
+		return PointerGetDatum(pg_detoast_datum_copy((struct varlena *) DatumGetPointer(val)));
+	return datumCopy(val, att->attbyval, att->attlen);
+}
 
 static char
 *t2c(text* in) {
@@ -127,11 +159,10 @@ btree_index_open(RangeVar *relvar) {
 #define	btree_index_close(r)	index_close((r), AccessShareLock)
 
 static Relation
-brin_index_open(RangeVar *relvar)
+brin_index_open(Oid indexOid)
 {
-	Oid relOid = RangeVarGetRelid(relvar, NoLock, false);
 	return checkOpenedRelation(
-				index_open(relOid, AccessShareLock), BRIN_AM_OID);
+				index_open(indexOid, AccessShareLock), BRIN_AM_OID);
 }
 
 #define	brin_index_close(r)	index_close((r), AccessShareLock)
@@ -224,21 +255,32 @@ gist_dumptree(Relation r, int level, BlockNumber blk, OffsetNumber coff, IdxInfo
 	ItemId		iid;
 	OffsetNumber i,
 				maxoff;
-	BlockNumber cblk;
 	char	   *pred;
+
+	CHECK_FOR_INTERRUPTS();
+	check_stack_depth();
 
 	pred = (char *) palloc(sizeof(char) * level * 4 + 1);
 	MemSet(pred, ' ', level*4);
 	pred[level*4] = '\0';
 
 	buffer = ReadBuffer(r, blk);
+	LockBuffer(buffer, GIST_SHARE);
 	page = (Page) BufferGetPage(buffer);
+
+	if (PageIsNew(page) || GistPageIsDeleted(page))
+	{
+		UnlockReleaseBuffer(buffer);
+		pfree(pred);
+		return;
+	}
 
 	maxoff = PageGetMaxOffsetNumber(page);
 
-
-	while ( (info->ptr-((char*)info->txt)) + level*4 + 128 >= info->len ) {
+	while ( (info->ptr-((char*)info->txt)) + level*4 + 256 >= info->len ) {
 		int dist=info->ptr-((char*)info->txt);
+		if (info->len > MaxAllocSize / 2)
+			elog(ERROR, "out of memory in gist_dumptree");
 		info->len *= 2;
 		info->txt=(text*)repalloc(info->txt, info->len);
 		info->ptr = ((char*)info->txt)+dist;
@@ -255,16 +297,30 @@ gist_dumptree(Relation r, int level, BlockNumber blk, OffsetNumber coff, IdxInfo
 		GistPageGetOpaque(page)->rightlink,
 		( GistPageGetOpaque(page)->rightlink == InvalidBlockNumber ) ? "InvalidBlockNumber" : "OK" );
 	info->ptr=strchr(info->ptr,'\0');
+	pfree(pred);
 
 	if (!GistPageIsLeaf(page) && ( info->maxlevel<0 || level<info->maxlevel ) )
+	{
+		BlockNumber *children = (BlockNumber *) palloc(sizeof(BlockNumber) * (maxoff + 1));
+		int nchildren = 0;
 		for (i = FirstOffsetNumber; i <= maxoff; i = OffsetNumberNext(i)) {
 			iid = PageGetItemId(page, i);
+			if (!ItemIdIsValid(iid) || !ItemIdHasStorage(iid))
+				continue;
 			which = (IndexTuple) PageGetItem(page, iid);
-			cblk = ItemPointerGetBlockNumber(&(which->t_tid));
-			gist_dumptree(r, level + 1, cblk, i, info);
+			children[nchildren++] = ItemPointerGetBlockNumber(&(which->t_tid));
 		}
-	ReleaseBuffer(buffer);
-	pfree(pred);
+		UnlockReleaseBuffer(buffer);
+
+		for (i = 0; i < nchildren; i++) {
+			gist_dumptree(r, level + 1, children[i], i + FirstOffsetNumber, info);
+		}
+		pfree(children);
+	}
+	else
+	{
+		UnlockReleaseBuffer(buffer);
+	}
 }
 
 PG_FUNCTION_INFO_V1(gist_tree);
@@ -288,6 +344,14 @@ gist_tree(PG_FUNCTION_ARGS) {
 	info.txt=(text*)palloc( info.len );
 	info.ptr=((char*)info.txt)+VARHDRSZ;
 	*info.ptr = '\0';
+
+	if (RelationGetNumberOfBlocks(index) == 0)
+	{
+		gist_index_close(index);
+		pfree(relname);
+		SET_VARSIZE(info.txt, VARHDRSZ);
+		PG_RETURN_POINTER(info.txt);
+	}
 
 	gist_dumptree(index, 0, GIST_ROOT_BLKNO, 0, &info);
 
@@ -318,42 +382,58 @@ gist_stattree(Relation r, int level, BlockNumber blk, OffsetNumber coff, IdxStat
 	ItemId		iid;
 	OffsetNumber i,
 				maxoff;
-	BlockNumber cblk;
-	char	   *pred;
+	int			used;
+	int			freeSpace;
 
-	pred = (char *) palloc(sizeof(char) * level * 4 + 1);
-	MemSet(pred, ' ', level*4);
-	pred[level*4] = '\0';
+	(void) coff;
+	CHECK_FOR_INTERRUPTS();
+	check_stack_depth();
 
 	buffer = ReadBuffer(r, blk);
+	LockBuffer(buffer, GIST_SHARE);
 	page = (Page) BufferGetPage(buffer);
 
+	if (PageIsNew(page) || GistPageIsDeleted(page))
+	{
+		UnlockReleaseBuffer(buffer);
+		return;
+	}
+
 	maxoff = PageGetMaxOffsetNumber(page);
+	freeSpace = (int) PageGetFreeSpace(page);
+	used = ((int) PAGESIZE > freeSpace) ? ((int) PAGESIZE - freeSpace) : 0;
 
 	info->numpages++;
-	info->tuplesize+=PAGESIZE-PageGetFreeSpace(page);
-	info->totalsize+=BLCKSZ;
-	info->numtuple+=maxoff;
+	info->tuplesize += used;
+	info->totalsize += BLCKSZ;
+	info->numtuple += maxoff;
 	if ( info->level < level )
 		info->level = level;
 
 	if (GistPageIsLeaf(page)) {
 		info->numleafpages++;
-		info->leaftuplesize+=PAGESIZE-PageGetFreeSpace(page);
-		info->numleaftuple+=maxoff;
+		info->leaftuplesize += used;
+		info->numleaftuple += maxoff;
+		UnlockReleaseBuffer(buffer);
 	} else {
+		BlockNumber *children = (BlockNumber *) palloc(sizeof(BlockNumber) * (maxoff + 1));
+		int nchildren = 0;
 		for (i = FirstOffsetNumber; i <= maxoff; i = OffsetNumberNext(i)) {
 			iid = PageGetItemId(page, i);
+			if (!ItemIdIsValid(iid) || !ItemIdHasStorage(iid))
+				continue;
 			which = (IndexTuple) PageGetItem(page, iid);
 			if ( GistTupleIsInvalid(which) )
 				info->numinvalidtuple++;
-			cblk = ItemPointerGetBlockNumber(&(which->t_tid));
-				gist_stattree(r, level + 1, cblk, i, info);
+			children[nchildren++] = ItemPointerGetBlockNumber(&(which->t_tid));
 		}
-	}
+		UnlockReleaseBuffer(buffer);
 
-	ReleaseBuffer(buffer);
-	pfree(pred);
+		for (i = 0; i < nchildren; i++) {
+			gist_stattree(r, level + 1, children[i], i + FirstOffsetNumber, info);
+		}
+		pfree(children);
+	}
 }
 
 PG_FUNCTION_INFO_V1(gist_stat);
@@ -369,29 +449,47 @@ gist_stat(PG_FUNCTION_ARGS) {
 	text *out=(text*)palloc(1024);
 	char *ptr=((char*)out)+VARHDRSZ;
 
-
-	relname_list = stringToQualifiedNameList(relname, "gist_tree");
+	relname_list = stringToQualifiedNameList(relname, "gist_stat");
 	relvar = makeRangeVarFromNameList(relname_list);
 	index = gist_index_open(relvar);
 	PG_FREE_IF_COPY(name,0);
 
 	memset(&info, 0, sizeof(IdxStat));
 
+	if (RelationGetNumberOfBlocks(index) == 0)
+	{
+		gist_index_close(index);
+		pfree(relname);
+		snprintf(ptr, 1024 - VARHDRSZ,
+			"Number of levels:          0\n"
+			"Number of pages:           0\n"
+			"Number of leaf pages:      0\n"
+			"Number of tuples:          0\n"
+			"Number of invalid tuples:  0\n"
+			"Number of leaf tuples:     0\n"
+			"Total size of tuples:      0 bytes\n"
+			"Total size of leaf tuples: 0 bytes\n"
+			"Total size of index:       0 bytes\n");
+		ptr = strchr(ptr, '\0');
+		SET_VARSIZE(out, ptr - ((char*)out));
+		PG_RETURN_POINTER(out);
+	}
+
 	gist_stattree(index, 0, GIST_ROOT_BLKNO, 0, &info);
 
 	gist_index_close(index);
 	pfree(relname);
 
-	sprintf(ptr,
+	snprintf(ptr, 1024 - VARHDRSZ,
 		"Number of levels:          %d\n"
 		"Number of pages:           %d\n"
 		"Number of leaf pages:      %d\n"
 		"Number of tuples:          %d\n"
 		"Number of invalid tuples:  %d\n"
 		"Number of leaf tuples:     %d\n"
-		"Total size of tuples:      "INT64_FORMAT" bytes\n"
-		"Total size of leaf tuples: "INT64_FORMAT" bytes\n"
-		"Total size of index:       "INT64_FORMAT" bytes\n",
+		"Total size of tuples:      "UINT64_FORMAT" bytes\n"
+		"Total size of leaf tuples: "UINT64_FORMAT" bytes\n"
+		"Total size of index:       "UINT64_FORMAT" bytes\n",
 		info.level+1,
 		info.numpages,
 		info.numleafpages,
@@ -409,56 +507,60 @@ gist_stat(PG_FUNCTION_ARGS) {
 }
 
 typedef struct GPItem {
-	Buffer	buffer;
-	Page	page;
+	BlockNumber		blk;
 	OffsetNumber	offset;
-	int	level;
-	struct GPItem *next;
+	int				level;
+	struct GPItem	*next;
 } GPItem;
 
 typedef struct {
-	List	*relname_list;
-	RangeVar   *relvar;
-	Relation		index;
-	Datum	*dvalues;
+	List		*relname_list;
+	RangeVar	*relvar;
+	Relation	index;
+	Datum		*dvalues;
 #if PG_VERSION_NUM >= 90600
-	bool	*nulls;
+	bool		*nulls;
 #else
-	char	*nulls;
+	char		*nulls;
 #endif
-	GPItem	*item;
+	GPItem		*item;
+	MemoryContext	tmpctx;
 } TypeStorage;
 
 static GPItem*
-openGPPage( FuncCallContext *funcctx, BlockNumber blk ) {
+pushGPPage( FuncCallContext *funcctx, BlockNumber blk, int level ) {
 	GPItem	*nitem;
 	MemoryContext	 oldcontext;
-	Relation index = ( (TypeStorage*)(funcctx->user_fctx) )->index;
+	TypeStorage *st = (TypeStorage*)(funcctx->user_fctx);
+
+	if (RelationGetNumberOfBlocks(st->index) <= blk)
+		return st->item;
 
 	oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
 	nitem = (GPItem*)palloc( sizeof(GPItem) );
-	memset(nitem,0,sizeof(GPItem));
-
-	nitem->buffer = ReadBuffer(index, blk);
-	nitem->page = (Page) BufferGetPage(nitem->buffer);
-	nitem->offset=FirstOffsetNumber;
-	nitem->next = ( (TypeStorage*)(funcctx->user_fctx) )->item;
-	nitem->level = ( nitem->next ) ? nitem->next->level+1 : 1;
-	( (TypeStorage*)(funcctx->user_fctx) )->item = nitem;
+	nitem->blk = blk;
+	nitem->offset = FirstOffsetNumber;
+	nitem->level = level;
+	nitem->next = st->item;
+	st->item = nitem;
 
 	MemoryContextSwitchTo(oldcontext);
 	return nitem;
 }
 
 static GPItem*
-closeGPPage( FuncCallContext *funcctx ) {
-	GPItem  *oitem = ( (TypeStorage*)(funcctx->user_fctx) )->item;
+popGPPage( FuncCallContext *funcctx ) {
+	TypeStorage *st = (TypeStorage*)(funcctx->user_fctx);
+	GPItem  *oitem;
 
-	( (TypeStorage*)(funcctx->user_fctx) )->item = oitem->next;
+	if (st == NULL || st->item == NULL)
+		return NULL;
 
-	ReleaseBuffer(oitem->buffer);
+	oitem = st->item;
+	st->item = oitem->next;
+
 	pfree( oitem );
-	return ( (TypeStorage*)(funcctx->user_fctx) )->item;
+	return st->item;
 }
 
 #if PG_VERSION_NUM >= 170000
@@ -469,6 +571,14 @@ closeGPPage( FuncCallContext *funcctx ) {
 #define TS_GET_TYPEVAL(s, i, v)	(s)->index->rd_att->attrs[(i)]->v
 #endif
 
+static void close_call( FuncCallContext  *funcctx );
+
+static void
+gist_print_cleanup_callback(void *arg) {
+	FuncCallContext *funcctx = (FuncCallContext *) arg;
+	close_call(funcctx);
+}
+
 static void
 setup_firstcall(FuncCallContext  *funcctx, text *name) {
 	MemoryContext	 oldcontext;
@@ -477,6 +587,7 @@ setup_firstcall(FuncCallContext  *funcctx, text *name) {
 	TupleDesc			tupdesc;
 	char			attname[NAMEDATALEN];
 	int i;
+	MemoryContextCallback *cb;
 
 	oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
 
@@ -485,12 +596,15 @@ setup_firstcall(FuncCallContext  *funcctx, text *name) {
 	st->relname_list = stringToQualifiedNameList(relname, "gist_tree");
 	st->relvar = makeRangeVarFromNameList(st->relname_list);
 	st->index = gist_index_open(st->relvar);
+	st->tmpctx = AllocSetContextCreate(funcctx->multi_call_memory_ctx,
+									   "gist_print_per_tuple",
+									   ALLOCSET_DEFAULT_SIZES);
 	funcctx->user_fctx = (void*)st;
 
 #if PG_VERSION_NUM >= 120000
 	tupdesc = CreateTemplateTupleDesc(st->index->rd_att->natts+2);
 #else
-	tupdesc = CreateTemplateTupleDesc(3 /* types */ + 1 /* level */ + 1 /* nlabel */ +  2 /* tids */ + 1, false);
+	tupdesc = CreateTemplateTupleDesc(st->index->rd_att->natts+2, false);
 #endif
 	TupleDescInitEntry(tupdesc, 1, "level", INT4OID, -1, 0);
 	TupleDescInitEntry(tupdesc, 2, "valid", BOOLOID, -1, 0);
@@ -505,32 +619,62 @@ setup_firstcall(FuncCallContext  *funcctx, text *name) {
 			TS_GET_TYPEVAL(st, i, attndims)
 		);
 	}
+	BlessTupleDesc(tupdesc);
 
 	st->dvalues = (Datum *) palloc((tupdesc->natts+2) * sizeof(Datum));
 	st->nulls = palloc((tupdesc->natts+2) * sizeof(*st->nulls));
 
-#if PG_VERSION_NUM >= 120000
 	funcctx->attinmeta = TupleDescGetAttInMetadata(tupdesc);
-#else
+#if PG_VERSION_NUM < 120000
 	funcctx->slot = TupleDescGetSlot(tupdesc);
 #endif
+
+	cb = (MemoryContextCallback *) MemoryContextAlloc(funcctx->multi_call_memory_ctx, sizeof(MemoryContextCallback));
+	cb->func = gist_print_cleanup_callback;
+	cb->arg = (void *) funcctx;
+	MemoryContextRegisterResetCallback(funcctx->multi_call_memory_ctx, cb);
 
 	MemoryContextSwitchTo(oldcontext);
 	pfree(relname);
 
-	st->item=openGPPage(funcctx, GIST_ROOT_BLKNO);
+	if (RelationGetNumberOfBlocks(st->index) > 0)
+		pushGPPage(funcctx, GIST_ROOT_BLKNO, 1);
+	else
+		st->item = NULL;
 }
 
 static void
 close_call( FuncCallContext  *funcctx ) {
 	TypeStorage *st = (TypeStorage*)(funcctx->user_fctx);
 
-	while(st->item && closeGPPage(funcctx));
+	if (st == NULL)
+		return;
 
-	pfree(st->dvalues);
-	pfree(st->nulls);
+	if (!IsAbortedTransactionBlockState())
+	{
+		while(st->item && popGPPage(funcctx));
 
-	gist_index_close(st->index);
+		if (st->index) {
+			gist_index_close(st->index);
+			st->index = NULL;
+		}
+	}
+	else
+	{
+		st->item = NULL;
+		st->index = NULL;
+	}
+
+	if (st->dvalues) {
+		pfree(st->dvalues);
+		st->dvalues = NULL;
+	}
+	if (st->nulls) {
+		pfree(st->nulls);
+		st->nulls = NULL;
+	}
+
+	funcctx->user_fctx = NULL;
 }
 
 PG_FUNCTION_INFO_V1(gist_print);
@@ -544,7 +688,9 @@ gist_print(PG_FUNCTION_ARGS) {
 	IndexTuple	  ituple;
 	HeapTuple	   htuple;
 	int i;
+	int max_natts;
 	bool isnull;
+	MemoryContext oldcontext;
 
 	if (SRF_IS_FIRSTCALL()) {
 		text	*name=PG_GETARG_TEXT_P(0);
@@ -556,48 +702,116 @@ gist_print(PG_FUNCTION_ARGS) {
 	funcctx = SRF_PERCALL_SETUP();
 	st = (TypeStorage*)(funcctx->user_fctx);
 
-	if ( !st->item ) {
+	if ( !st || !st->item ) {
 		close_call(funcctx);
 		SRF_RETURN_DONE(funcctx);
 	}
 
-	while( st->item->offset > PageGetMaxOffsetNumber( st->item->page ) ) {
-		if ( ! closeGPPage(funcctx) ) {
-			close_call(funcctx);
-			SRF_RETURN_DONE(funcctx);
-		}
-	}
+	CHECK_FOR_INTERRUPTS();
 
-	iid = PageGetItemId( st->item->page, st->item->offset );
-	ituple = (IndexTuple) PageGetItem(st->item->page, iid);
+	/* Reset per-tuple memory context from previous iteration (Fix 2) */
+	MemoryContextReset(st->tmpctx);
 
-	st->dvalues[0] = Int32GetDatum( st->item->level );
-	st->nulls[0] = ISNOTNULL;
-	st->dvalues[1] = BoolGetDatum( (!GistPageIsLeaf(st->item->page) && GistTupleIsInvalid(ituple)) ? false : true );
-	st->nulls[1] = ISNOTNULL;
-	for(i=2; i<funcctx->attinmeta->tupdesc->natts; i++)
+	while (st->item != NULL)
 	{
-		if ( !GistPageIsLeaf(st->item->page) && GistTupleIsInvalid(ituple) )
+		Buffer buffer;
+		Page page;
+		bool isLeaf;
+		bool isInvalid;
+		BlockNumber downlink = InvalidBlockNumber;
+		int current_level;
+
+		buffer = ReadBuffer(st->index, st->item->blk);
+		LockBuffer(buffer, GIST_SHARE);
+		page = (Page) BufferGetPage(buffer);
+
+		if (PageIsNew(page) || GistPageIsDeleted(page) || st->item->offset > PageGetMaxOffsetNumber(page))
 		{
-			st->dvalues[i] = (Datum)0;
-			st->nulls[i] = ISNULL;
-		} else {
-			st->dvalues[i] = index_getattr(ituple, i-1, st->index->rd_att, &isnull);
-			st->nulls[i] = ( isnull ) ? ISNULL : ISNOTNULL;
+			UnlockReleaseBuffer(buffer);
+			popGPPage(funcctx);
+			continue;
 		}
+
+		iid = PageGetItemId(page, st->item->offset);
+		if (!ItemIdIsValid(iid) || !ItemIdHasStorage(iid))
+		{
+			st->item->offset = OffsetNumberNext(st->item->offset);
+			UnlockReleaseBuffer(buffer);
+			continue;
+		}
+
+		ituple = (IndexTuple) PageGetItem(page, iid);
+		isLeaf = GistPageIsLeaf(page);
+		isInvalid = (!isLeaf && GistTupleIsInvalid(ituple));
+		if (!isLeaf)
+			downlink = ItemPointerGetBlockNumber(&(ituple->t_tid));
+		current_level = st->item->level;
+
+#if PG_VERSION_NUM >= 110000
+		max_natts = isLeaf
+						? st->index->rd_att->natts
+						: IndexRelationGetNumberOfKeyAttributes(st->index);
+#else
+		max_natts = st->index->rd_att->natts;
+#endif
+
+		/* Switch to per-tuple memory context for datum detoasting/copying */
+		oldcontext = MemoryContextSwitchTo(st->tmpctx);
+
+		st->dvalues[0] = Int32GetDatum(current_level);
+		st->nulls[0] = ISNOTNULL;
+		st->dvalues[1] = BoolGetDatum(isInvalid ? false : true);
+		st->nulls[1] = ISNOTNULL;
+
+		for (i = 2; i < funcctx->attinmeta->tupdesc->natts; i++)
+		{
+			if (isInvalid || (i - 1 > max_natts))
+			{
+				st->dvalues[i] = (Datum) 0;
+				st->nulls[i] = ISNULL;
+			}
+			else
+			{
+				Datum val = index_getattr(ituple, i - 1, st->index->rd_att, &isnull);
+				if (isnull)
+				{
+					st->dvalues[i] = (Datum) 0;
+					st->nulls[i] = ISNULL;
+				}
+				else
+				{
+					/* Fix 5: detoast & safe copy into tmpctx */
+					Form_pg_attribute att = INDEX_GET_ATTR(st->index, i - 2);
+					st->dvalues[i] = safe_index_datum(val, att);
+					st->nulls[i] = ISNOTNULL;
+				}
+			}
+		}
+
+		/* Advance offset for next inspection */
+		st->item->offset = OffsetNumberNext(st->item->offset);
+
+		/* Fix 3: Release buffer lock and pin BEFORE yielding control! */
+		UnlockReleaseBuffer(buffer);
+
+		/* If non-leaf, push downlink child page onto the stack */
+		if (!isLeaf && BlockNumberIsValid(downlink))
+			pushGPPage(funcctx, downlink, current_level + 1);
+
+		htuple = heap_formtuple(funcctx->attinmeta->tupdesc, st->dvalues, st->nulls);
+#if PG_VERSION_NUM >= 120000
+		result = HeapTupleGetDatum(htuple);
+#else
+		result = TupleGetDatum(funcctx->slot, htuple);
+#endif
+
+		MemoryContextSwitchTo(oldcontext);
+
+		SRF_RETURN_NEXT(funcctx, result);
 	}
 
-	htuple = heap_formtuple(funcctx->attinmeta->tupdesc, st->dvalues, st->nulls);
-#if PG_VERSION_NUM >= 120000
-	result = HeapTupleGetDatum(htuple);
-#else
-	result = TupleGetDatum(funcctx->slot, htuple);
-#endif
-	st->item->offset = OffsetNumberNext(st->item->offset);
-	if ( !GistPageIsLeaf(st->item->page) )
-		openGPPage(funcctx, ItemPointerGetBlockNumber(&(ituple->t_tid)) );
-
-	SRF_RETURN_NEXT(funcctx, result);
+	close_call(funcctx);
+	SRF_RETURN_DONE(funcctx);
 }
 
 typedef struct GinStatState {
@@ -606,6 +820,7 @@ typedef struct GinStatState {
 	OffsetNumber	attnum;
 
 	Buffer			buffer;
+	bool			bufferIsLocked;
 	OffsetNumber	offset;
 	Datum			curval;
 #if PG_VERSION_NUM >= 90100
@@ -617,6 +832,7 @@ typedef struct GinStatState {
 #else
 	char			nulls[2];
 #endif
+	MemoryContext	tmpctx;
 } GinStatState;
 
 static bool
@@ -634,8 +850,10 @@ moveRightIfItNeeded( GinStatState *st )
 			return false;  /* no more page */
 
 		LockBuffer(st->buffer, GIN_UNLOCK);
+		st->bufferIsLocked = false;
 		st->buffer = ReleaseAndReadBuffer(st->buffer, st->index, blkno);
 		LockBuffer(st->buffer, GIN_SHARE);
+		st->bufferIsLocked = true;
 		st->offset = FirstOffsetNumber;
 	}
 
@@ -657,6 +875,7 @@ refindPosition(GinStatState *st)
 		BlockNumber blkno;
 
 		LockBuffer(st->buffer, GIN_SHARE);
+		st->bufferIsLocked = true;
 
 		page = BufferGetPage(st->buffer);
 		if (GinPageIsLeaf(page))
@@ -666,6 +885,7 @@ refindPosition(GinStatState *st)
 		blkno = GinItemPointerGetBlockNumber(&(itup)->t_tid);
 
 		LockBuffer(st->buffer,GIN_UNLOCK);
+		st->bufferIsLocked = false;
 		st->buffer = ReleaseAndReadBuffer(st->buffer, st->index, blkno);
 	}
 
@@ -685,6 +905,8 @@ refindPosition(GinStatState *st)
 
 		if (moveRightIfItNeeded(st)==false)
 			return false;
+
+		page = BufferGetPage(st->buffer);
 
 		itup = (IndexTuple) PageGetItem(page, PageGetItemId(page, st->offset));
 #if PG_VERSION_NUM >= 90100
@@ -712,6 +934,7 @@ refindPosition(GinStatState *st)
 		{
 			if ( st->curval && !TS_GET_TYPEVAL(st, st->attnum, attbyval) )
 				pfree( (void*) st->curval );
+			st->curval = (Datum)0;
 			return true;
 		}
 
@@ -721,12 +944,21 @@ refindPosition(GinStatState *st)
 	return false;
 }
 
+static void gin_close_call(FuncCallContext *funcctx);
+
+static void
+gin_stat_cleanup_callback(void *arg) {
+	FuncCallContext *funcctx = (FuncCallContext *) arg;
+	gin_close_call(funcctx);
+}
+
 static void
 gin_setup_firstcall(FuncCallContext  *funcctx, text *name, int attnum) {
 	MemoryContext	 oldcontext;
 	GinStatState	 *st;
 	char *relname=t2c(name);
 	TupleDesc			tupdesc;
+	MemoryContextCallback *cb;
 
 	oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
 
@@ -735,6 +967,9 @@ gin_setup_firstcall(FuncCallContext  *funcctx, text *name, int attnum) {
 	st->index = gin_index_open(
 		 makeRangeVarFromNameList(stringToQualifiedNameList(relname, "gin_stat")));
 	initGinState( &st->ginstate, st->index );
+	st->tmpctx = AllocSetContextCreate(funcctx->multi_call_memory_ctx,
+									   "gin_stat_per_tuple",
+									   ALLOCSET_DEFAULT_SIZES);
 
 #if PG_VERSION_NUM >= 80400
 	if (attnum < 0 || attnum >= st->index->rd_att->natts)
@@ -756,6 +991,7 @@ gin_setup_firstcall(FuncCallContext  *funcctx, text *name, int attnum) {
 			TS_GET_TYPEVAL(st, st->attnum, atttypmod),
 			TS_GET_TYPEVAL(st, st->attnum, attndims));
 	TupleDescInitEntry(tupdesc, 2, "nrow", INT4OID, -1, 0);
+	BlessTupleDesc(tupdesc);
 
 	memset( st->nulls, ISNOTNULL, 2*sizeof(*st->nulls) );
 
@@ -765,11 +1001,58 @@ gin_setup_firstcall(FuncCallContext  *funcctx, text *name, int attnum) {
 	funcctx->slot = TupleDescGetSlot(tupdesc);
 #endif
 
+	cb = (MemoryContextCallback *) MemoryContextAlloc(funcctx->multi_call_memory_ctx, sizeof(MemoryContextCallback));
+	cb->func = gin_stat_cleanup_callback;
+	cb->arg = (void *) funcctx;
+	MemoryContextRegisterResetCallback(funcctx->multi_call_memory_ctx, cb);
+
 	MemoryContextSwitchTo(oldcontext);
 	pfree(relname);
 
 	st->offset = InvalidOffsetNumber;
-	st->buffer = ReadBuffer( st->index, GIN_ROOT_BLKNO );
+	if (RelationGetNumberOfBlocks(st->index) <= GIN_ROOT_BLKNO)
+		st->buffer = InvalidBuffer;
+	else
+		st->buffer = ReadBuffer( st->index, GIN_ROOT_BLKNO );
+	st->bufferIsLocked = false;
+}
+
+static void
+gin_close_call(FuncCallContext *funcctx) {
+	GinStatState *st = (GinStatState*)(funcctx->user_fctx);
+
+	if (st == NULL)
+		return;
+
+	if (!IsAbortedTransactionBlockState())
+	{
+		if (BufferIsValid(st->buffer)) {
+			if (st->bufferIsLocked)
+				UnlockReleaseBuffer(st->buffer);
+			else
+				ReleaseBuffer(st->buffer);
+			st->buffer = InvalidBuffer;
+			st->bufferIsLocked = false;
+		}
+		if (st->index) {
+			gin_index_close(st->index);
+			st->index = NULL;
+		}
+	}
+	else
+	{
+		st->buffer = InvalidBuffer;
+		st->bufferIsLocked = false;
+		st->index = NULL;
+	}
+
+	if (st->curval && !TS_GET_TYPEVAL(st, st->attnum, attbyval))
+	{
+		pfree((void*) st->curval);
+		st->curval = (Datum)0;
+	}
+
+	funcctx->user_fctx = NULL;
 }
 
 static void
@@ -824,8 +1107,11 @@ processTuple( FuncCallContext  *funcctx,  GinStatState *st, IndexTuple itup ) {
 		uint32		predictNumber;
 
 		LockBuffer(st->buffer, GIN_UNLOCK);
+		st->bufferIsLocked = false;
 #if PG_VERSION_NUM >= 90400
-#if PG_VERSION_NUM >= 90600 && PG_VERSION_NUM < 140000
+#if PG_VERSION_NUM >= 170000
+		stack = ginScanBeginPostingTree(&btree, st->index, rootblkno);
+#elif PG_VERSION_NUM >= 90600
 		stack = ginScanBeginPostingTree(&btree, st->index, rootblkno, NULL);
 #else
 		stack = ginScanBeginPostingTree(&btree, st->index, rootblkno);
@@ -835,7 +1121,10 @@ processTuple( FuncCallContext  *funcctx,  GinStatState *st, IndexTuple itup ) {
 		list = GinDataLeafPageGetItems(page, &nlist, minItem);
 		pfree(list);
 		predictNumber = stack->predictNumber;
-		st->dvalues[1] = Int32GetDatum( predictNumber * nlist );
+		{
+			int64 totalRows = (int64) predictNumber * (int64) nlist;
+			st->dvalues[1] = Int32GetDatum( (totalRows > PG_INT32_MAX) ? PG_INT32_MAX : (int32) totalRows );
+		}
 #elif PG_VERSION_NUM >= 90100
 		gdi = ginPrepareScanPostingTree(st->index, rootblkno, TRUE);
 		entrybuffer = ginScanBeginPostingTree(gdi);
@@ -861,6 +1150,7 @@ processTuple( FuncCallContext  *funcctx,  GinStatState *st, IndexTuple itup ) {
 	} else {
 		st->dvalues[1] = Int32GetDatum( GinGetNPosting(itup) );
 		LockBuffer(st->buffer, GIN_UNLOCK);
+		st->bufferIsLocked = false;
 	}
 }
 
@@ -885,20 +1175,21 @@ gin_stat(PG_FUNCTION_ARGS) {
 	funcctx = SRF_PERCALL_SETUP();
 	st = (GinStatState*)(funcctx->user_fctx);
 
-	if ( refindPosition(st) == false ) {
-		UnlockReleaseBuffer( st->buffer );
-		gin_index_close(st->index);
-
+	if ( !st || !BufferIsValid(st->buffer) || refindPosition(st) == false ) {
+		gin_close_call(funcctx);
 		SRF_RETURN_DONE(funcctx);
 	}
 
+	/* Reset per-tuple memory context from previous iteration (Fix 2) */
+	MemoryContextReset(st->tmpctx);
+
 	for(;;) {
+		CHECK_FOR_INTERRUPTS();
+
 		st->offset++;
 
 		if (moveRightIfItNeeded(st)==false) {
-			UnlockReleaseBuffer( st->buffer );
-			gin_index_close(st->index);
-
+			gin_close_call(funcctx);
 			SRF_RETURN_DONE(funcctx);
 		}
 
@@ -907,18 +1198,28 @@ gin_stat(PG_FUNCTION_ARGS) {
 
 #if PG_VERSION_NUM >= 80400
 		if (st->attnum + 1 == gintuple_get_attrnum(&st->ginstate, ituple))
-#endif
 			break;
+		if (gintuple_get_attrnum(&st->ginstate, ituple) > st->attnum + 1) {
+			gin_close_call(funcctx);
+			SRF_RETURN_DONE(funcctx);
+		}
+#else
+		break;
+#endif
 	}
 
 	processTuple( funcctx,  st, ituple );
 
-	htuple = heap_formtuple(funcctx->attinmeta->tupdesc, st->dvalues, st->nulls);
+	{
+		MemoryContext oldcontext = MemoryContextSwitchTo(st->tmpctx);
+		htuple = heap_formtuple(funcctx->attinmeta->tupdesc, st->dvalues, st->nulls);
 #if PG_VERSION_NUM >= 120000
-	result = HeapTupleGetDatum(htuple);
+		result = HeapTupleGetDatum(htuple);
 #else
-	result = TupleGetDatum(funcctx->slot, htuple);
+		result = TupleGetDatum(funcctx->slot, htuple);
 #endif
+		MemoryContextSwitchTo(oldcontext);
+	}
 
 	SRF_RETURN_NEXT(funcctx, result);
 }
@@ -928,18 +1229,15 @@ Datum gin_count_estimate(PG_FUNCTION_ARGS);
 #if PG_VERSION_NUM >= 80300
 Datum
 gin_count_estimate(PG_FUNCTION_ARGS) {
-	text			*name=PG_GETARG_TEXT_P(0);
+	text			*name=PG_GETARG_TEXT_PP(0);
 	Relation		index;
 	IndexScanDesc	scan;
 	int64			count = 0;
-	char			*relname=t2c(name);
 	ScanKeyData		key;
+	List			*relname_list;
+	RangeVar		*relvar;
 #if PG_VERSION_NUM >= 80400
-	TIDBitmap		*bitmap = tbm_create(work_mem * 1024L
-#if PG_VERSION_NUM >= 100000
-										 , NULL
-#endif
-										 );
+	TIDBitmap		*bitmap;
 #else
 #define	MAXTIDS		1024
 	ItemPointerData	tids[MAXTIDS];
@@ -947,13 +1245,23 @@ gin_count_estimate(PG_FUNCTION_ARGS) {
 	bool			more;
 #endif
 
-	index = gin_index_open(
-		 makeRangeVarFromNameList(stringToQualifiedNameList(relname, "gin_count_estimate")));
+	relname_list = textToQualifiedNameList(name);
+	relvar = makeRangeVarFromNameList(relname_list);
+	index = gin_index_open(relvar);
 
 	if ( index->rd_opcintype[0] != TSVECTOROID ) {
 		gin_index_close(index);
+		PG_FREE_IF_COPY(name, 0);
 		elog(ERROR, "Column type is not a tsvector");
 	}
+
+#if PG_VERSION_NUM >= 80400
+	bitmap = tbm_create(work_mem * 1024L
+#if PG_VERSION_NUM >= 100000
+						, NULL
+#endif
+						);
+#endif
 
 	key.sk_flags = 0;
 	key.sk_attno = 1;
@@ -991,6 +1299,7 @@ gin_count_estimate(PG_FUNCTION_ARGS) {
 
 	index_endscan( scan );
 	gin_index_close(index);
+	PG_FREE_IF_COPY(name, 0);
 
 	PG_RETURN_INT64(count);
 }
@@ -1053,11 +1362,38 @@ spgist_stat(PG_FUNCTION_ARGS)
 
 	totalPages = RelationGetNumberOfBlocks(index);
 
+	if (totalPages <= 1)
+	{
+		index_close(index, AccessShareLock);
+		snprintf(res, sizeof(res),
+				 "totalPages:         0\n"
+				 "deletedPages:       0\n"
+				 "innerPages:         0\n"
+				 "leafPages:          0\n"
+				 "emptyPages:         0\n"
+				 "usedSpace:          0.00 kbytes\n"
+				 "usedInnerSpace:     0.00 kbytes\n"
+				 "usedLeafSpace:      0.00 kbytes\n"
+				 "freeSpace:          0.00 kbytes\n"
+				 "fillRatio:          0.00%%\n"
+				 "leafTuples:         0\n"
+				 "innerTuples:        0\n"
+				 "innerAllTheSame:    0\n"
+				 "leafPlaceholders:   0\n"
+				 "innerPlaceholders:  0\n"
+				 "leafRedirects:      0\n"
+				 "innerRedirects:     0");
+		PG_FREE_IF_COPY(name, 0);
+		PG_RETURN_DATUM(CStringGetTextDatum(res));
+	}
+
 	for (blkno = SPGIST_ROOT_BLKNO; blkno < totalPages; blkno++)
 	{
 		Buffer	  buffer;
 		Page		page;
 		int		 pageFree;
+
+		CHECK_FOR_INTERRUPTS();
 
 		buffer = ReadBuffer(index, blkno);
 		LockBuffer(buffer, BUFFER_LOCK_SHARE);
@@ -1090,12 +1426,13 @@ spgist_stat(PG_FUNCTION_ARGS)
 			nInnerRedirect += SpGistPageGetOpaque(page)->nRedirection;
 			for (i = FirstOffsetNumber; i <= max; i++)
 			{
-				SpGistInnerTuple it;
-
-				it = (SpGistInnerTuple) PageGetItem(page,
-													PageGetItemId(page, i));
-				if (it->allTheSame)
-					nAllTheSame++;
+				ItemId iid = PageGetItemId(page, i);
+				if (ItemIdHasStorage(iid))
+				{
+					SpGistInnerTuple it = (SpGistInnerTuple) PageGetItem(page, iid);
+					if (it->tupstate == SPGIST_LIVE && it->allTheSame)
+						nAllTheSame++;
+				}
 			}
 		}
 
@@ -1150,6 +1487,7 @@ spgist_stat(PG_FUNCTION_ARGS)
 			 nLeafPlaceholder, nInnerPlaceholder,
 			 nLeafRedirect, nInnerRedirect);
 
+	PG_FREE_IF_COPY(name, 0);
 	PG_RETURN_DATUM(CStringGetTextDatum(res));
 #endif
 }
@@ -1172,7 +1510,30 @@ typedef struct SPGistPrint {
 	char			nulls[8];
 #endif
 	List		*stack;
+	MemoryContext	tmpctx;
 } SPGistPrint;
+
+static Oid
+resolve_spgist_type(Relation index, SpGistTypeDesc *typedesc)
+{
+	if (typedesc->type != VOIDOID && get_typtype(typedesc->type) == TYPTYPE_PSEUDO)
+	{
+		Oid concreteType = INDEX_GET_ATTR(index, 0)->atttypid;
+		typedesc->type = concreteType;
+		get_typlenbyval(concreteType, &typedesc->attlen, &typedesc->attbyval);
+	}
+	return typedesc->type;
+}
+
+static Datum
+safe_spgist_datum(Datum val, SpGistTypeDesc *typedesc)
+{
+	if (typedesc->attbyval)
+		return val;
+	if (typedesc->attlen == -1)
+		return PointerGetDatum(pg_detoast_datum_copy((struct varlena *) DatumGetPointer(val)));
+	return datumCopy(val, typedesc->attbyval, typedesc->attlen);
+}
 
 static void
 pushSPGistPrint(FuncCallContext *funcctx, SPGistPrint *prst, ItemPointer ip, int level) {
@@ -1191,8 +1552,25 @@ pushSPGistPrint(FuncCallContext *funcctx, SPGistPrint *prst, ItemPointer ip, int
 }
 
 static void
+spgist_print_cleanup_callback(void *arg)
+{
+	SPGistPrint *prst = (SPGistPrint *) arg;
+	if (prst && prst->index != NULL)
+	{
+		if (!IsAbortedTransactionBlockState())
+			index_close(prst->index, AccessShareLock);
+		prst->index = NULL;
+	}
+}
+
+static void
 close_spgist_print(SPGistPrint *prst) {
-	index_close(prst->index, AccessShareLock);
+	if (prst && prst->index != NULL)
+	{
+		if (!IsAbortedTransactionBlockState())
+			index_close(prst->index, AccessShareLock);
+		prst->index = NULL;
+	}
 }
 #endif
 
@@ -1219,6 +1597,7 @@ spgist_print(PG_FUNCTION_ARGS)
 		Relation		index;
 		ItemPointerData	ipd;
 		TupleDesc		tupdesc;
+		MemoryContextCallback *cb;
 
 		funcctx = SRF_FIRSTCALL_INIT();
 		relvar = makeRangeVarFromNameList(textToQualifiedNameList(name));
@@ -1236,47 +1615,73 @@ spgist_print(PG_FUNCTION_ARGS)
 
 		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
 
-		prst = palloc(sizeof(*prst));
+		prst = palloc0(sizeof(*prst));
 
 		prst->index = index;
 		initSpGistState(&prst->state, index);
+		prst->tmpctx = AllocSetContextCreate(funcctx->multi_call_memory_ctx,
+											 "spgist_print_per_tuple",
+											 ALLOCSET_DEFAULT_SIZES);
+
+		{
+			Oid prefixType = resolve_spgist_type(index, &prst->state.attPrefixType);
+			Oid labelType = prst->state.attLabelType.type;
+			Oid leafType = resolve_spgist_type(index, &prst->state.attLeafType);
 
 #if PG_VERSION_NUM >= 120000
-		tupdesc = CreateTemplateTupleDesc(3 /* types */ + 1 /* level */ + 1 /* nlabel */ +  2 /* tids */ + 1);
+			tupdesc = CreateTemplateTupleDesc(3 /* types */ + 1 /* level */ + 1 /* nlabel */ +  2 /* tids */ + 1);
 #else
-		tupdesc = CreateTemplateTupleDesc(3 /* types */ + 1 /* level */ + 1 /* nlabel */ +  2 /* tids */ + 1, false);
+			tupdesc = CreateTemplateTupleDesc(3 /* types */ + 1 /* level */ + 1 /* nlabel */ +  2 /* tids */ + 1, false);
 #endif
-		TupleDescInitEntry(tupdesc, 1, "tid", TIDOID, -1, 0);
-		TupleDescInitEntry(tupdesc, 2, "allthesame", BOOLOID, -1, 0);
-		TupleDescInitEntry(tupdesc, 3, "node", INT4OID, -1, 0);
-		TupleDescInitEntry(tupdesc, 4, "level", INT4OID, -1, 0);
-		TupleDescInitEntry(tupdesc, 5, "tid_pointer", TIDOID, -1, 0);
-		TupleDescInitEntry(tupdesc, 6, "prefix",
-				(prst->state.attPrefixType.type == VOIDOID) ? INT4OID : prst->state.attPrefixType.type, -1, 0);
-		TupleDescInitEntry(tupdesc, 7, "label",
-				(prst->state.attLabelType.type == VOIDOID) ? INT4OID : prst->state.attLabelType.type, -1, 0);
-		TupleDescInitEntry(tupdesc, 8, "leaf",
-				(prst->state.attType.type == VOIDOID) ? INT4OID : prst->state.attType.type, -1, 0);
+			TupleDescInitEntry(tupdesc, 1, "tid", TIDOID, -1, 0);
+			TupleDescInitEntry(tupdesc, 2, "allthesame", BOOLOID, -1, 0);
+			TupleDescInitEntry(tupdesc, 3, "node", INT4OID, -1, 0);
+			TupleDescInitEntry(tupdesc, 4, "level", INT4OID, -1, 0);
+			TupleDescInitEntry(tupdesc, 5, "tid_pointer", TIDOID, -1, 0);
+			TupleDescInitEntry(tupdesc, 6, "prefix",
+					(prefixType == VOIDOID) ? INT4OID : prefixType, -1, 0);
+			TupleDescInitEntry(tupdesc, 7, "label",
+					(labelType == VOIDOID) ? INT4OID : labelType, -1, 0);
+			TupleDescInitEntry(tupdesc, 8, "leaf",
+					(leafType == VOIDOID) ? INT4OID : leafType, -1, 0);
+		}
 
-#if PG_VERSION_NUM >= 120000
+		BlessTupleDesc(tupdesc);
+
 		funcctx->attinmeta = TupleDescGetAttInMetadata(tupdesc);
-#else
+#if PG_VERSION_NUM < 120000
 		funcctx->slot = TupleDescGetSlot(tupdesc);
 #endif
 
 		funcctx->user_fctx = (void*)prst;
 
-		MemoryContextSwitchTo(oldcontext);
+		cb = (MemoryContextCallback *) palloc(sizeof(MemoryContextCallback));
+		cb->func = spgist_print_cleanup_callback;
+		cb->arg = (void *) prst;
+		MemoryContextRegisterResetCallback(funcctx->multi_call_memory_ctx, cb);
 
-		ItemPointerSet(&ipd, SPGIST_ROOT_BLKNO, FirstOffsetNumber);
 		prst->stack = NIL;
-		pushSPGistPrint(funcctx, prst, &ipd, 1);
+		if (RelationGetNumberOfBlocks(index) > SPGIST_ROOT_BLKNO)
+		{
+			ItemPointerSet(&ipd, SPGIST_ROOT_BLKNO, FirstOffsetNumber);
+			pushSPGistPrint(funcctx, prst, &ipd, 1);
+			if (RelationGetNumberOfBlocks(index) > SPGIST_NULL_BLKNO)
+			{
+				ItemPointerSet(&ipd, SPGIST_NULL_BLKNO, FirstOffsetNumber);
+				pushSPGistPrint(funcctx, prst, &ipd, 1);
+			}
+		}
+
+		MemoryContextSwitchTo(oldcontext);
 
 		PG_FREE_IF_COPY(name,0);
 	}
 
 	funcctx = SRF_PERCALL_SETUP();
 	prst = (SPGistPrint*)(funcctx->user_fctx);
+
+	/* Reset per-tuple memory context from previous call (Fix 2) */
+	MemoryContextReset(prst->tmpctx);
 
 next:
 	for(;;) {
@@ -1292,7 +1697,7 @@ next:
 
 		if (ItemPointerIsValid(&s->iptr))
 			break;
-		free(s);
+		pfree(s);
 	}
 
 	do {
@@ -1300,42 +1705,87 @@ next:
 		Page				page;
 		SpGistDeadTuple		dtuple;
 		ItemPointer			tid;
+		BlockNumber			blkno = ItemPointerGetBlockNumber(&s->iptr);
+		OffsetNumber		offset = ItemPointerGetOffsetNumber(&s->iptr);
 
-		buffer = ReadBuffer(prst->index, ItemPointerGetBlockNumber(&s->iptr));
+		buffer = ReadBuffer(prst->index, blkno);
 		LockBuffer(buffer, BUFFER_LOCK_SHARE);
 
 		page = BufferGetPage(buffer);
-		if (ItemPointerGetOffsetNumber(&s->iptr) > PageGetMaxOffsetNumber(page)) {
+		if (PageIsNew(page) || SpGistPageIsDeleted(page) || offset > PageGetMaxOffsetNumber(page)) {
 			UnlockReleaseBuffer(buffer);
 			pfree(s);
 			goto next;
 		}
 
-		dtuple = (SpGistDeadTuple)PageGetItem(page, PageGetItemId(page, ItemPointerGetOffsetNumber(&s->iptr)));
+		{
+			ItemId iid = PageGetItemId(page, offset);
+			if (!ItemIdIsValid(iid) || !ItemIdHasStorage(iid)) {
+				UnlockReleaseBuffer(buffer);
+				pfree(s);
+				goto next;
+			}
+			dtuple = (SpGistDeadTuple) PageGetItem(page, iid);
+		}
 
-		if (dtuple->tupstate != SPGIST_LIVE)  {
+		if (dtuple->tupstate == SPGIST_REDIRECT) {
+			ItemPointerData redir_ipd = ((SpGistDeadTuple)dtuple)->pointer;
+			UnlockReleaseBuffer(buffer);
+			pfree(s);
+			pushSPGistPrint(funcctx, prst, &redir_ipd, s->level);
+			goto next;
+		}
+
+		if (dtuple->tupstate != SPGIST_LIVE) {
 			UnlockReleaseBuffer(buffer);
 			pfree(s);
 			goto next;
 		}
 
 		if (SpGistPageIsLeaf(page)) {
-				SpGistLeafTuple	leafTuple = (SpGistLeafTuple)dtuple;
+			OffsetNumber max = PageGetMaxOffsetNumber(page);
+			SpGistLeafTuple	leafTuple;
 
-				tid = palloc(sizeof(ItemPointerData));
-				*tid = s->iptr;
-				prst->dvalues[0] = PointerGetDatum(tid);
-				prst->nulls[0] = ISNOTNULL;
-				prst->nulls[1] = ISNULL;
-				prst->nulls[2] = ISNULL;
-				prst->dvalues[3]  = s->level;
-				prst->nulls[3] = ISNOTNULL;
-				prst->nulls[4] = ISNULL;
-				prst->nulls[5] = ISNULL;
-				prst->nulls[6] = ISNULL;
-				prst->dvalues[7]  = datumCopy(SGLTDATUM(leafTuple, &prst->state),
-											prst->state.attType.attbyval, prst->state.attType.attlen);
+			if (SpGistBlockIsRoot(blkno) && offset < max) {
+				ItemPointerData next_ipd;
+				ItemPointerSet(&next_ipd, blkno, offset + 1);
+				pushSPGistPrint(funcctx, prst, &next_ipd, s->level);
+			}
+
+			leafTuple = (SpGistLeafTuple)dtuple;
+
+			if (!SpGistBlockIsRoot(blkno)) {
+				OffsetNumber nextOffset = SGLT_GET_NEXTOFFSET(leafTuple);
+				if (nextOffset != InvalidOffsetNumber && nextOffset <= max) {
+					ItemPointerData next_ipd;
+					ItemPointerSet(&next_ipd, blkno, nextOffset);
+					pushSPGistPrint(funcctx, prst, &next_ipd, s->level);
+				}
+			}
+
+			oldcontext = MemoryContextSwitchTo(prst->tmpctx);
+
+			tid = palloc(sizeof(ItemPointerData));
+			*tid = s->iptr;
+			prst->dvalues[0] = PointerGetDatum(tid);
+			prst->nulls[0] = ISNOTNULL;
+			prst->nulls[1] = ISNULL;
+			prst->nulls[2] = ISNULL;
+			prst->dvalues[3]  = Int32GetDatum(s->level);
+			prst->nulls[3] = ISNOTNULL;
+			prst->nulls[4] = ISNULL;
+			prst->nulls[5] = ISNULL;
+			prst->nulls[6] = ISNULL;
+			if (SpGistPageStoresNulls(page)) {
+				prst->dvalues[7] = (Datum) 0;
+				prst->nulls[7] = ISNULL;
+			} else {
+				prst->dvalues[7] = safe_spgist_datum(SGLTDATUM(leafTuple, &prst->state),
+													 &prst->state.attLeafType);
 				prst->nulls[7] = ISNOTNULL;
+			}
+
+			MemoryContextSwitchTo(oldcontext);
 		} else {
 			SpGistInnerTuple	innerTuple = (SpGistInnerTuple)dtuple;
 			int					i;
@@ -1354,33 +1804,37 @@ next:
 				goto next;
 			}
 
+			oldcontext = MemoryContextSwitchTo(prst->tmpctx);
+
 			tid = palloc(sizeof(ItemPointerData));
 			*tid = s->iptr;
 			prst->dvalues[0] = PointerGetDatum(tid);
 			prst->nulls[0] = ISNOTNULL;
-			prst->dvalues[1] = innerTuple->allTheSame;
+			prst->dvalues[1] = BoolGetDatum(innerTuple->allTheSame);
 			prst->nulls[1] = ISNOTNULL;
-			prst->dvalues[2] = Int32GetDatum(s->nlabel);
+			prst->dvalues[2] = Int32GetDatum(i);
 			prst->nulls[2] = ISNOTNULL;
-			prst->dvalues[3]  = s->level;
+			prst->dvalues[3]  = Int32GetDatum(s->level);
 			prst->nulls[3] = ISNOTNULL;
 			tid = palloc(sizeof(ItemPointerData));
 			*tid = node->t_tid;
 			prst->dvalues[4] = PointerGetDatum(tid);
-			prst->nulls[5] = ISNOTNULL;
+			prst->nulls[4] = ISNOTNULL;
 			if (innerTuple->prefixSize > 0) {
-				prst->dvalues[5]  = datumCopy(SGITDATUM(innerTuple, &prst->state),
-											prst->state.attPrefixType.attbyval, prst->state.attPrefixType.attlen);
+				prst->dvalues[5]  = safe_spgist_datum(SGITDATUM(innerTuple, &prst->state),
+													  &prst->state.attPrefixType);
 				prst->nulls[5] = ISNOTNULL;
 			} else
 				prst->nulls[5] = ISNULL;
-			if (!IndexTupleHasNulls(node)) {
-				prst->dvalues[6]  = datumCopy(SGNTDATUM(node, &prst->state),
-											prst->state.attLabelType.attbyval, prst->state.attLabelType.attlen);
+			if (!innerTuple->allTheSame && OidIsValid(prst->state.config.labelType) && prst->state.config.labelType != VOIDOID && !IndexTupleHasNulls(node)) {
+				prst->dvalues[6]  = safe_spgist_datum(SGNTDATUM(node, &prst->state),
+													  &prst->state.attLabelType);
 				prst->nulls[6] = ISNOTNULL;
 			} else
 				prst->nulls[6] = ISNULL;
 			prst->nulls[7] = ISNULL;
+
+			MemoryContextSwitchTo(oldcontext);
 
 			pushSPGistPrint(funcctx, prst, &node->t_tid, s->level + 1);
 			s->nlabel = i + 1;
@@ -1394,12 +1848,16 @@ next:
 		if (s) pfree(s);
 	} while(0);
 
-	htuple = heap_formtuple(funcctx->attinmeta->tupdesc, prst->dvalues, prst->nulls);
+	{
+		MemoryContext tupcontext = MemoryContextSwitchTo(prst->tmpctx);
+		htuple = heap_formtuple(funcctx->attinmeta->tupdesc, prst->dvalues, prst->nulls);
 #if PG_VERSION_NUM >= 120000
-	result = HeapTupleGetDatum(htuple);
+		result = HeapTupleGetDatum(htuple);
 #else
-	result = TupleGetDatum(funcctx->slot, htuple);
+		result = TupleGetDatum(funcctx->slot, htuple);
 #endif
+		MemoryContextSwitchTo(tupcontext);
+	}
 
 	SRF_RETURN_NEXT(funcctx, result);
 #endif
@@ -1461,11 +1919,43 @@ gin_statpage(PG_FUNCTION_ARGS)
 
 	totalPages = RelationGetNumberOfBlocks(index);
 
+	if (totalPages <= GIN_ROOT_BLKNO)
+	{
+		index_close(index, AccessShareLock);
+		snprintf(res, sizeof(res),
+				 "totalPages:            0\n"
+#if PG_VERSION_NUM >= 100000
+				 "deletedPages:          0\n"
+				 "emptyDataPages:        0\n"
+#endif
+				 "dataPages:             0\n"
+				 "dataInnerPages:        0\n"
+				 "dataLeafPages:         0\n"
+				 "dataInnerFreeSpace:    0\n"
+				 "dataLeafFreeSpace:     0\n"
+				 "dataInnerTuplesCount:  0\n"
+				 "dataLeafIptrsCount:    0\n"
+				 "entryPages:            0\n"
+				 "entryInnerPages:       0\n"
+				 "entryLeafPages:        0\n"
+				 "entryInnerFreeSpace:   0\n"
+				 "entryLeafFreeSpace:    0\n"
+				 "entryInnerTuplesCount: 0\n"
+				 "entryLeafTuplesCount:  0\n"
+				 "entryPostingSize:      0\n"
+				 "entryPostingCount:     0\n"
+				 "entryAttrSize:         0\n");
+		PG_FREE_IF_COPY(name, 0);
+		PG_RETURN_DATUM(CStringGetTextDatum(res));
+	}
+
 	for (blkno = GIN_ROOT_BLKNO; blkno < totalPages; blkno++)
 	{
 		Buffer		buffer;
 		Page		page;
 		PageHeader	header;
+
+		CHECK_FOR_INTERRUPTS();
 
 		buffer = ReadBuffer(index, blkno);
 		LockBuffer(buffer, BUFFER_LOCK_SHARE);
@@ -1533,14 +2023,32 @@ gin_statpage(PG_FUNCTION_ARGS)
 
 			for (i = 1; i <= maxoff; i++)
 			{
-				itup = (IndexTuple) PageGetItem(page, PageGetItemId(page, i));
+				ItemId iid = PageGetItemId(page, i);
+
+				if (!ItemIdIsValid(iid) || !ItemIdHasStorage(iid))
+					continue;
+
+				itup = (IndexTuple) PageGetItem(page, iid);
 
 				if (GinPageIsLeaf(page))
 				{
-					GinPostingList *list = (GinPostingList *)GinGetPosting(itup);
-					entryPostingCount += GinGetNPosting(itup);
-					entryPostingSize += SizeOfGinPostingList(list);
-					entryAttrSize += GinGetPostingOffset(itup) - IndexInfoFindDataOffset((itup)->t_info);
+					if (GinIsPostingTree(itup))
+					{
+						entryAttrSize += IndexTupleSize(itup) - IndexInfoFindDataOffset((itup)->t_info);
+					}
+					else if (GinItupIsCompressed(itup))
+					{
+						GinPostingList *list = (GinPostingList *)GinGetPosting(itup);
+						entryPostingCount += GinGetNPosting(itup);
+						entryPostingSize += SizeOfGinPostingList(list);
+						entryAttrSize += GinGetPostingOffset(itup) - IndexInfoFindDataOffset((itup)->t_info);
+					}
+					else
+					{
+						entryPostingCount += GinGetNPosting(itup);
+						entryPostingSize += GinGetNPosting(itup) * sizeof(ItemPointerData);
+						entryAttrSize += GinGetPostingOffset(itup) - IndexInfoFindDataOffset((itup)->t_info);
+					}
 				}
 				else
 				{
@@ -1553,7 +2061,8 @@ gin_statpage(PG_FUNCTION_ARGS)
 	}
 
 	index_close(index, AccessShareLock);
-	totalPages--;
+	if (totalPages > 0)
+		totalPages--;
 
 	snprintf(res, sizeof(res),
 			 "totalPages:            %u\n"
@@ -1564,20 +2073,20 @@ gin_statpage(PG_FUNCTION_ARGS)
 			 "dataPages:             %u\n"
 			 "dataInnerPages:        %u\n"
 			 "dataLeafPages:         %u\n"
-			 "dataInnerFreeSpace:    " INT64_FORMAT "\n"
-			 "dataLeafFreeSpace:     " INT64_FORMAT "\n"
-			 "dataInnerTuplesCount:  " INT64_FORMAT "\n"
-			 "dataLeafIptrsCount:    " INT64_FORMAT "\n"
+			 "dataInnerFreeSpace:    " UINT64_FORMAT "\n"
+			 "dataLeafFreeSpace:     " UINT64_FORMAT "\n"
+			 "dataInnerTuplesCount:  " UINT64_FORMAT "\n"
+			 "dataLeafIptrsCount:    " UINT64_FORMAT "\n"
 			 "entryPages:            %u\n"
 			 "entryInnerPages:       %u\n"
 			 "entryLeafPages:        %u\n"
-			 "entryInnerFreeSpace:   " INT64_FORMAT "\n"
-			 "entryLeafFreeSpace:    " INT64_FORMAT "\n"
-			 "entryInnerTuplesCount: " INT64_FORMAT "\n"
-			 "entryLeafTuplesCount:  " INT64_FORMAT "\n"
-			 "entryPostingSize:      " INT64_FORMAT "\n"
-			 "entryPostingCount:     " INT64_FORMAT "\n"
-			 "entryAttrSize:         " INT64_FORMAT "\n",
+			 "entryInnerFreeSpace:   " UINT64_FORMAT "\n"
+			 "entryLeafFreeSpace:    " UINT64_FORMAT "\n"
+			 "entryInnerTuplesCount: " UINT64_FORMAT "\n"
+			 "entryLeafTuplesCount:  " UINT64_FORMAT "\n"
+			 "entryPostingSize:      " UINT64_FORMAT "\n"
+			 "entryPostingCount:     " UINT64_FORMAT "\n"
+			 "entryAttrSize:         " UINT64_FORMAT "\n",
 			 totalPages,
 #if PG_VERSION_NUM >= 100000
 			 deletedPages,
@@ -1602,6 +2111,7 @@ gin_statpage(PG_FUNCTION_ARGS)
 			 entryAttrSize
 			 );
 
+	PG_FREE_IF_COPY(name, 0);
 	PG_RETURN_DATUM(CStringGetTextDatum(res));
 #endif
 }
@@ -1628,12 +2138,28 @@ btree_deep_search(Relation rel, int level,
 	ItemId			iid;
 	OffsetNumber	i,
 					maxoff;
-	BlockNumber		cblk;
 	BTPageOpaque	opaque;
-	Buffer buffer =  _bt_getbuf(rel, blk, BT_READ);
+	Buffer buffer;
+
+	CHECK_FOR_INTERRUPTS();
+	check_stack_depth();
+
+	if (!BlockNumberIsValid(blk) || blk == P_NONE)
+		return;
+
+	buffer = _bt_getbuf(rel, blk, BT_READ);
+	if (!BufferIsValid(buffer))
+		return;
 
 	page = (Page) BufferGetPage(buffer);
 	opaque = (BTPageOpaque) PageGetSpecialPointer(page);
+
+	if (PageIsNew(page) || P_IGNORE(opaque))
+	{
+		_bt_relbuf(rel, buffer);
+		return;
+	}
+
 	maxoff = PageGetMaxOffsetNumber(page);
 
 	switch (cond)
@@ -1650,9 +2176,24 @@ btree_deep_search(Relation rel, int level,
 
 			if (P_ISLEAF(opaque))
 			{
+				int dataTuples = maxoff - (P_RIGHTMOST(opaque) ? 0 : 1);
+				if (dataTuples < 0) dataTuples = 0;
+
 				btreeIdxInfo->idxStat.numleafpages++;
 				btreeIdxInfo->idxStat.leaftuplesize+=(BLCKSZ - PageGetFreeSpace(page));
-				btreeIdxInfo->idxStat.numleaftuple+=maxoff;
+
+				for (i = P_FIRSTDATAKEY(opaque); i <= maxoff; i = OffsetNumberNext(i))
+				{
+					iid = PageGetItemId(page, i);
+					if (!ItemIdIsValid(iid) || !ItemIdHasStorage(iid))
+						continue;
+#if PG_VERSION_NUM >= 130000
+					itup = (IndexTuple) PageGetItem(page, iid);
+					if (BTreeTupleIsPosting(itup))
+						dataTuples += (BTreeTupleGetNPosting(itup) - 1);
+#endif
+				}
+				btreeIdxInfo->idxStat.numleaftuple += dataTuples;
 			}
 			break;
 		}
@@ -1661,9 +2202,11 @@ btree_deep_search(Relation rel, int level,
 			char *pred;
 
 			while ( (btreeIdxInfo->idxInfo.ptr-((char*)btreeIdxInfo->idxInfo.txt))
-					+ level*4 + 128 >= btreeIdxInfo->idxInfo.len )
+					+ level*4 + 256 >= btreeIdxInfo->idxInfo.len )
 			{
 					int dist=btreeIdxInfo->idxInfo.ptr-((char*)btreeIdxInfo->idxInfo.txt);
+					if (btreeIdxInfo->idxInfo.len > MaxAllocSize / 2)
+						elog(ERROR, "out of memory in btree_tree");
 					btreeIdxInfo->idxInfo.len *= 2;
 					btreeIdxInfo->idxInfo.txt=(text*)repalloc(btreeIdxInfo->idxInfo.txt,
 							btreeIdxInfo->idxInfo.len);
@@ -1674,7 +2217,7 @@ btree_deep_search(Relation rel, int level,
 			memset(pred, ' ', level * 4);
 			pred[level * 4] = '\0';
 
-			sprintf(btreeIdxInfo->idxInfo.ptr, "%slvl: %d, blk: %d, numTuples: %d\n",
+			sprintf(btreeIdxInfo->idxInfo.ptr, "%slvl: %d, blk: %u, numTuples: %d\n",
 							pred,
 							level,
 							blk,
@@ -1689,20 +2232,33 @@ btree_deep_search(Relation rel, int level,
 	if (!P_ISLEAF(opaque) && ((level < btreeIdxInfo->idxInfo.maxlevel)
 			||(btreeIdxInfo->idxInfo.maxlevel<0)))
 	{
+		int nchildren = 0;
+		BlockNumber *children = (BlockNumber *) palloc(sizeof(BlockNumber) * (maxoff + 1));
+
 		for (i = P_FIRSTDATAKEY(opaque); i <= maxoff; i = OffsetNumberNext(i))
 		{
 			iid = PageGetItemId(page, i);
 
-			if (!ItemIdIsValid(iid))
+			if (!ItemIdIsValid(iid) || !ItemIdHasStorage(iid))
+			{
 				btreeIdxInfo->idxStat.numinvalidtuple++;
+				continue;
+			}
 
 			itup = (IndexTuple) PageGetItem(page, iid);
-			cblk = BTreeTupleGetDownLink(itup);
-
-			btree_deep_search(rel, level + 1, cblk, btreeIdxInfo, cond);
+			children[nchildren++] = BTreeTupleGetDownLink(itup);
 		}
+		_bt_relbuf(rel, buffer);
+
+		for (i = 0; i < nchildren; i++)
+			btree_deep_search(rel, level + 1, children[i], btreeIdxInfo, cond);
+
+		pfree(children);
 	}
-	UnlockReleaseBuffer(buffer);
+	else
+	{
+		_bt_relbuf(rel, buffer);
+	}
 }
 
 /*
@@ -1736,6 +2292,25 @@ btree_stat(PG_FUNCTION_ARGS)
 
 	memset(&btreeIdxInfo.idxStat, 0, sizeof(IdxStat));
 
+	if (RelationGetNumberOfBlocks(index) == 0)
+	{
+		btree_index_close(index);
+		snprintf(ptr, 1024 - VARHDRSZ,
+			"Number of levels:          0\n"
+			"Number of pages:           0\n"
+			"Number of leaf pages:      0\n"
+			"Number of tuples:          0\n"
+			"Number of invalid tuples:  0\n"
+			"Number of leaf tuples:     0\n"
+			"Total size of tuples:      0 bytes\n"
+			"Total size of leaf tuples: 0 bytes\n"
+			"Total size of index:       0 bytes\n");
+		ptr = strchr(ptr, '\0');
+		PG_FREE_IF_COPY(name, 0);
+		SET_VARSIZE(out, ptr - ((char*)out));
+		PG_RETURN_POINTER(out);
+	}
+
 	/* Start dts from root */
 	metabuf = _bt_getbuf(index, BTREE_METAPAGE, BT_READ);
 	metapg = BufferGetPage(metabuf);
@@ -1748,16 +2323,16 @@ btree_stat(PG_FUNCTION_ARGS)
 
 	btree_index_close(index);
 
-	sprintf(ptr,
+	snprintf(ptr, 1024 - VARHDRSZ,
 		"Number of levels:          %d\n"
 		"Number of pages:           %d\n"
 		"Number of leaf pages:      %d\n"
 		"Number of tuples:          %d\n"
 		"Number of invalid tuples:  %d\n"
 		"Number of leaf tuples:     %d\n"
-		"Total size of tuples:      "INT64_FORMAT" bytes\n"
-		"Total size of leaf tuples: "INT64_FORMAT" bytes\n"
-		"Total size of index:       "INT64_FORMAT" bytes\n",
+		"Total size of tuples:      "UINT64_FORMAT" bytes\n"
+		"Total size of leaf tuples: "UINT64_FORMAT" bytes\n"
+		"Total size of index:       "UINT64_FORMAT" bytes\n",
 		(rootBlk == P_NONE) ? 0 : btreeIdxInfo.idxStat.level+1,
 		btreeIdxInfo.idxStat.numpages,
 		btreeIdxInfo.idxStat.numleafpages,
@@ -1770,14 +2345,15 @@ btree_stat(PG_FUNCTION_ARGS)
 
 	ptr=strchr(ptr,'\0');
 
+	PG_FREE_IF_COPY(name, 0);
+
 	SET_VARSIZE(out, ptr-((char*)out));
 	PG_RETURN_POINTER(out);
 }
 
 typedef struct BtPItem
 {
-	Buffer		   buffer;
-	Page		   page;
+	BlockNumber	   blk;
 	OffsetNumber   offset;
 	int			   level;
 	struct BtPItem *next;
@@ -1791,35 +2367,26 @@ typedef struct
 	Datum	 *dvalues;
 	bool	 *nulls;
 	BtPItem	 *item;
+	MemoryContext tmpctx;
 } BtTypeStorage;
 
-/*
- * Open page in btree
- * Returns nitem as a pointer to stack for btree levels stored.
- * We process tuples from buffer in the top of nitem.
- * After the complete processing of a top buffer
- * we return to buffer on one level upper and go to next btree leaf.
- */
 static BtPItem*
-openBtPPage( FuncCallContext *funcctx, BlockNumber blk )
+pushBtPPage( FuncCallContext *funcctx, BlockNumber blk, int level )
 {
 	BtPItem		  *nitem;
 	MemoryContext oldcontext;
+	BtTypeStorage *st = (BtTypeStorage*)(funcctx->user_fctx);
 
-	Relation index = ( (BtTypeStorage*)(funcctx->user_fctx) )->index;
-	BTPageOpaque opaque;
+	if (RelationGetNumberOfBlocks(st->index) <= blk)
+		return st->item;
+
 	oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
 	nitem = (BtPItem*)palloc( sizeof(BtPItem) );
-	memset(nitem,0,sizeof(BtPItem));
-
-	nitem->buffer = _bt_getbuf(index, blk, BT_READ);
-	Assert(BufferIsValid(nitem->buffer));
-	nitem->page = (Page) BufferGetPage(nitem->buffer);
-	opaque = (BTPageOpaque)PageGetSpecialPointer(nitem->page);
-	nitem->offset=P_FIRSTDATAKEY(opaque);
-	nitem->next = ( (BtTypeStorage*)(funcctx->user_fctx) )->item;
-	nitem->level = ( nitem->next ) ? nitem->next->level+1 : 1;
-	( (BtTypeStorage*)(funcctx->user_fctx) )->item = nitem;
+	nitem->blk = blk;
+	nitem->offset = InvalidOffsetNumber;
+	nitem->level = level;
+	nitem->next = st->item;
+	st->item = nitem;
 
 	MemoryContextSwitchTo(oldcontext);
 
@@ -1827,28 +2394,65 @@ openBtPPage( FuncCallContext *funcctx, BlockNumber blk )
 }
 
 static BtPItem*
-closeBtPPage( FuncCallContext *funcctx )
+popBtPPage( FuncCallContext *funcctx )
 {
-	BtPItem  *oitem = ( (BtTypeStorage*)(funcctx->user_fctx) )->item;
+	BtTypeStorage *st = (BtTypeStorage*)(funcctx->user_fctx);
+	BtPItem  *oitem;
 
-	( (BtTypeStorage*)(funcctx->user_fctx) )->item = oitem->next;
+	if (st == NULL || st->item == NULL)
+		return NULL;
 
-	UnlockReleaseBuffer(oitem->buffer);
+	oitem = st->item;
+	st->item = oitem->next;
+
 	pfree( oitem );
-	return ( (BtTypeStorage*)(funcctx->user_fctx) )->item;
+	return st->item;
+}
+
+static void btree_close_call(FuncCallContext *funcctx);
+
+static void
+btree_print_cleanup_callback(void *arg)
+{
+	FuncCallContext *funcctx = (FuncCallContext *) arg;
+	btree_close_call(funcctx);
 }
 
 static void
 btree_close_call( FuncCallContext  *funcctx )
 {
 	BtTypeStorage *st = (BtTypeStorage*)(funcctx->user_fctx);
+	if (!st)
+		return;
 
-	while(st->item && closeBtPPage(funcctx));
+	if (!IsAbortedTransactionBlockState())
+	{
+		while (st->item)
+			popBtPPage(funcctx);
 
-	pfree(st->dvalues);
-	pfree(st->nulls);
+		if (st->index != NULL)
+		{
+			btree_index_close(st->index);
+			st->index = NULL;
+		}
+	}
+	else
+	{
+		st->item = NULL;
+		st->index = NULL;
+	}
 
-	btree_index_close(st->index);
+	if (st->dvalues)
+	{
+		pfree(st->dvalues);
+		st->dvalues = NULL;
+	}
+	if (st->nulls)
+	{
+		pfree(st->nulls);
+		st->nulls = NULL;
+	}
+	funcctx->user_fctx = NULL;
 }
 
 /*
@@ -1865,6 +2469,7 @@ btree_setup_firstcall(FuncCallContext  *funcctx, text *name)
 	int			  i;
 	BlockNumber   blk;
 	Buffer		  buffer;
+	MemoryContextCallback *cb;
 
 	oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
 
@@ -1874,7 +2479,17 @@ btree_setup_firstcall(FuncCallContext  *funcctx, text *name)
 	st->relvar = makeRangeVarFromNameList(st->relname_list);
 	st->index = btree_index_open(st->relvar);
 	st->item = NULL;
+	st->tmpctx = AllocSetContextCreate(funcctx->multi_call_memory_ctx,
+									   "btree_print_per_tuple",
+									   ALLOCSET_DEFAULT_SIZES);
 	funcctx->user_fctx = (void*)st;
+
+	if (RelationGetNumberOfBlocks(st->index) == 0)
+	{
+		MemoryContextSwitchTo(oldcontext);
+		st->item = NULL;
+		return;
+	}
 
 	tupdesc = CreateTemplateTupleDesc(st->index->rd_att->natts+2);
 	TupleDescInitEntry(tupdesc, 1, "level", INT4OID, -1, 0);
@@ -1898,6 +2513,11 @@ btree_setup_firstcall(FuncCallContext  *funcctx, text *name)
 
 	funcctx->attinmeta = TupleDescGetAttInMetadata(tupdesc);
 
+	cb = (MemoryContextCallback *) palloc(sizeof(MemoryContextCallback));
+	cb->func = btree_print_cleanup_callback;
+	cb->arg = (void *) funcctx;
+	MemoryContextRegisterResetCallback(funcctx->multi_call_memory_ctx, cb);
+
 	buffer = _bt_gettrueroot(st->index);
 	if (BufferIsValid(buffer))
 	{
@@ -1906,7 +2526,7 @@ btree_setup_firstcall(FuncCallContext  *funcctx, text *name)
 
 		MemoryContextSwitchTo(oldcontext);
 
-		st->item=openBtPPage(funcctx, blk);
+		pushBtPPage(funcctx, blk, 1);
 	}
 	else
 	{
@@ -1949,6 +2569,14 @@ btree_tree(PG_FUNCTION_ARGS)
 	relvar = makeRangeVarFromNameList(relname_list);
 	index = btree_index_open(relvar);
 
+	if (RelationGetNumberOfBlocks(index) == 0)
+	{
+		btree_index_close(index);
+		PG_FREE_IF_COPY(name, 0);
+		SET_VARSIZE(btreeIdxInfo.idxInfo.txt, VARHDRSZ);
+		PG_RETURN_POINTER(btreeIdxInfo.idxInfo.txt);
+	}
+
 	/* Start dts from root block */
 	metabuf = _bt_getbuf(index, BTREE_METAPAGE, BT_READ);
 	metapg = BufferGetPage(metabuf);
@@ -1962,6 +2590,8 @@ btree_tree(PG_FUNCTION_ARGS)
 	btree_index_close(index);
 
 	btreeIdxInfo.idxInfo.ptr=strchr(btreeIdxInfo.idxInfo.ptr,'\0');
+
+	PG_FREE_IF_COPY(name, 0);
 
 	SET_VARSIZE(btreeIdxInfo.idxInfo.txt,
 			btreeIdxInfo.idxInfo.ptr-((char*)btreeIdxInfo.idxInfo.txt));
@@ -1986,8 +2616,9 @@ btree_print(PG_FUNCTION_ARGS)
 	HeapTuple	   htuple;
 	int				i;
 	bool			isnull;
-	BTPageOpaque opaque;
-	Datum result=(Datum)0;
+	BTPageOpaque	opaque;
+	Datum			result=(Datum)0;
+	MemoryContext	oldcontext;
 
 	if (SRF_IS_FIRSTCALL())
 	{
@@ -2000,73 +2631,110 @@ btree_print(PG_FUNCTION_ARGS)
 	funcctx = SRF_PERCALL_SETUP();
 	st = (BtTypeStorage*)(funcctx->user_fctx);
 
-	/*
-	 * Looking through the stack of btree pages.
-	 * If the item == NULL, then the search is over.
-	 * For each btree page we look through all the tuples.
-	 * If the offset is larger than the btree page size, the search is over.
-	 */
+	CHECK_FOR_INTERRUPTS();
 
-	if ( !st->item )
+	if ( !st || !st->item )
 	{
 		btree_close_call(funcctx);
 		SRF_RETURN_DONE(funcctx);
 	}
 
-	/* View all tuples on the page */
-	while( st->item->offset > PageGetMaxOffsetNumber( st->item->page ) )
+	/* Reset per-tuple memory context from previous iteration (Fix 2) */
+	MemoryContextReset(st->tmpctx);
+
+	while (st->item != NULL)
 	{
-		if ( ! closeBtPPage(funcctx) ) {
-			btree_close_call(funcctx);
-			SRF_RETURN_DONE(funcctx);
+		Buffer buffer = _bt_getbuf(st->index, st->item->blk, BT_READ);
+		Page page = BufferGetPage(buffer);
+		bool isLeaf;
+		BlockNumber downlink = InvalidBlockNumber;
+		int current_level;
+
+		opaque = (BTPageOpaque) PageGetSpecialPointer(page);
+
+		if (st->item->offset == InvalidOffsetNumber)
+			st->item->offset = P_FIRSTDATAKEY(opaque);
+
+		if (PageIsNew(page) || P_IGNORE(opaque) || st->item->offset > PageGetMaxOffsetNumber(page))
+		{
+			_bt_relbuf(st->index, buffer);
+			popBtPPage(funcctx);
+			continue;
 		}
-	}
 
-	iid = PageGetItemId( st->item->page, st->item->offset );
-	ituple = (IndexTuple) PageGetItem(st->item->page, iid);
+		iid = PageGetItemId(page, st->item->offset);
+		if (!ItemIdIsValid(iid) || !ItemIdHasStorage(iid))
+		{
+			st->item->offset = OffsetNumberNext(st->item->offset);
+			_bt_relbuf(st->index, buffer);
+			continue;
+		}
 
-	st->dvalues[0] = Int32GetDatum( st->item->level );
-	st->nulls[0] = ISNOTNULL;
-	opaque = (BTPageOpaque)PageGetSpecialPointer(st->item->page);
-	st->dvalues[1] = BoolGetDatum(P_ISLEAF(opaque) && !ItemPointerIsValid(&(ituple->t_tid)) ? false : true);
-	st->nulls[1] = ISNOTNULL;
-	for(i=2; i<funcctx->attinmeta->tupdesc->natts; i++)
-	{
+		ituple = (IndexTuple) PageGetItem(page, iid);
+		isLeaf = P_ISLEAF(opaque);
+		if (!isLeaf)
+			downlink = BTreeTupleGetDownLink(ituple);
+		current_level = st->item->level;
+
+		/* Switch to per-tuple memory context for datum detoasting/copying */
+		oldcontext = MemoryContextSwitchTo(st->tmpctx);
+
+		st->dvalues[0] = Int32GetDatum(current_level);
+		st->nulls[0] = ISNOTNULL;
+		st->dvalues[1] = BoolGetDatum(true);
+		st->nulls[1] = ISNOTNULL;
+
+		for (i = 2; i < funcctx->attinmeta->tupdesc->natts; i++)
+		{
+			int tup_natts = BTreeTupleGetNAtts(ituple, st->index);
+
+			if (i - 1 > tup_natts)
+			{
+				st->dvalues[i] = (Datum) 0;
+				st->nulls[i] = ISNULL;
+			}
+			else
+			{
+				Datum val = index_getattr(ituple, i - 1, st->index->rd_att, &isnull);
+				if (isnull)
+				{
+					st->dvalues[i] = (Datum) 0;
+					st->nulls[i] = ISNULL;
+				}
+				else
+				{
+					/* Fix 5: detoast & safe copy into tmpctx */
+					Form_pg_attribute att = INDEX_GET_ATTR(st->index, i - 2);
+					st->dvalues[i] = safe_index_datum(val, att);
+					st->nulls[i] = ISNOTNULL;
+				}
+			}
+		}
+
+		/* Advance offset */
+		st->item->offset = OffsetNumberNext(st->item->offset);
+
+		/* Fix 3: Release buffer lock and pin BEFORE yielding control! */
+		_bt_relbuf(st->index, buffer);
+
+		/* If non-leaf, push downlink child page onto the stack */
+		if (!isLeaf && BlockNumberIsValid(downlink))
+			pushBtPPage(funcctx, downlink, current_level + 1);
+
+		htuple = heap_formtuple(funcctx->attinmeta->tupdesc, st->dvalues, st->nulls);
 #if PG_VERSION_NUM >= 120000
-		int tup_natts = BTreeTupleGetNAtts(ituple, st->index);
-#elif PG_VERSION_NUM >= 110000
-		int tup_natts = P_ISLEAF(opaque) ? st->index->rd_att->natts : IndexRelationGetNumberOfKeyAttributes(st->index);
+		result = HeapTupleGetDatum(htuple);
 #else
-		int tup_natts = st->index->rd_att->natts;
+		result = TupleGetDatum(funcctx->slot, htuple);
 #endif
 
-		if ((!P_ISLEAF(opaque) && !ItemPointerIsValid(&(ituple->t_tid))) || (i - 1 > tup_natts))
-		{
-			st->dvalues[i] = (Datum)0;
-			st->nulls[i] = ISNULL;
-		}
-		else
-		{
-			st->dvalues[i] = index_getattr(ituple, i-1, st->index->rd_att, &isnull);
-			st->nulls[i] = ( isnull ) ? ISNULL : ISNOTNULL;
-		}
+		MemoryContextSwitchTo(oldcontext);
+
+		SRF_RETURN_NEXT(funcctx, result);
 	}
 
-	htuple = heap_formtuple(funcctx->attinmeta->tupdesc, st->dvalues, st->nulls);
-#if PG_VERSION_NUM >= 120000
-	result = HeapTupleGetDatum(htuple);
-#else
-	result = TupleGetDatum(funcctx->slot, htuple);
-#endif
-	st->item->offset = OffsetNumberNext(st->item->offset);
-
-	if (!P_ISLEAF(opaque))
-	{
-		BlockNumber blk = BTreeTupleGetDownLink(ituple);
-		openBtPPage(funcctx, blk );
-	}
-
-	SRF_RETURN_NEXT(funcctx, result);
+	btree_close_call(funcctx);
+	SRF_RETURN_DONE(funcctx);
 }
 
 /*
@@ -2089,6 +2757,7 @@ brin_stat(PG_FUNCTION_ARGS)
 	BrinRevmap *revmap;
 	Relation heapRel;
 	BrinDesc *bdesc;
+	Oid indexOid, heapOid;
 
 	Buffer buf;
 
@@ -2104,63 +2773,68 @@ brin_stat(PG_FUNCTION_ARGS)
 
 	relname_list = textToQualifiedNameList(name);
 	relvar = makeRangeVarFromNameList(relname_list);
-	index = brin_index_open(relvar);
+	indexOid = RangeVarGetRelid(relvar, NoLock, false);
+	heapOid = IndexGetRelation(indexOid, true);
+	if (!OidIsValid(heapOid))
+		elog(ERROR, "relation \"%s\" is not an index", relvar->relname);
 
-#if PG_VERSION_NUM >= 140000
-	revmap = brinRevmapInitialize(index, &pagesPerRange);
-#else
-	revmap = brinRevmapInitialize(index, &pagesPerRange, NULL);
-#endif
-	heapRel = table_open(IndexGetRelation(RelationGetRelid(index), false),
-								 AccessShareLock);
+	/* Strict lock hierarchy: table first, then index */
+	heapRel = table_open(heapOid, AccessShareLock);
+	index = brin_index_open(indexOid);
+
+	revmap = GEVEL_BRIN_REVMAP_INIT(index, &pagesPerRange);
+
 	/* Determine range of pages to process */
-	heapNumBlocks = RelationGetNumberOfBlocks(heapRel); // total pages
+	heapNumBlocks = RelationGetNumberOfBlocks(heapRel);
 
-	table_close(heapRel, AccessShareLock);
-
-	/* The index is up to date, no update required */
 	startBlk = 0;
 
 	buf = InvalidBuffer;
 	bdesc = brin_build_desc(index);
 
-	/* Scan the revmap */
-	for (; startBlk < heapNumBlocks; startBlk += pagesPerRange)
 	{
-		BrinTuple  *tup;
-		OffsetNumber off;
-		Page	page;
+		BlockNumber last_buf_blkno = InvalidBlockNumber;
 
-		numRevmapPages++;
-		/* Get on-disk tuple */
-#if PG_VERSION_NUM >= 140000
-		tup = brinGetTupleForHeapBlock(revmap, startBlk, &buf, &off, NULL,
-				   BUFFER_LOCK_SHARE);
-#else
-		tup = brinGetTupleForHeapBlock(revmap, startBlk, &buf, &off, NULL,
-				   BUFFER_LOCK_SHARE, NULL);
-#endif
-
-		if (tup)
+		/* Scan the revmap */
+		for (; startBlk < heapNumBlocks; startBlk += pagesPerRange)
 		{
-			numTuples++;
-			page = BufferGetPage(buf);
+			BrinTuple  *tup;
+			OffsetNumber off;
+			Page	page;
+			Size	tupSize = 0;
 
-			if (BRIN_IS_REGULAR_PAGE(page))
-				numRegularPages++;
-			freeSpace += PageGetFreeSpace(page);
-			usedSpace += MAXALIGN(sizeof(BrinMemTuple) +
-					sizeof(BrinValues) * bdesc->bd_tupdesc->natts);
-		}
-		else
-			/* If the revmap page points to void */
-			numEmptyPages++;
+			CHECK_FOR_INTERRUPTS();
 
-		if (BufferIsValid(buf))
-		{
-			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-			ReleaseBuffer(buf);
-			buf = InvalidBuffer;
+			numRevmapPages++;
+			/* Get on-disk tuple */
+			tup = GEVEL_BRIN_GET_TUPLE(revmap, startBlk, &buf, &off, &tupSize,
+					   BUFFER_LOCK_SHARE);
+
+			if (tup)
+			{
+				numTuples++;
+				page = BufferGetPage(buf);
+
+				if (last_buf_blkno != BufferGetBlockNumber(buf))
+				{
+					if (BRIN_IS_REGULAR_PAGE(page))
+						numRegularPages++;
+					freeSpace += PageGetFreeSpace(page);
+					last_buf_blkno = BufferGetBlockNumber(buf);
+				}
+				usedSpace += MAXALIGN((tupSize > 0) ? tupSize : sizeof(BrinMemTuple) +
+						sizeof(BrinValues) * bdesc->bd_tupdesc->natts);
+			}
+			else
+				/* If the revmap page points to void */
+				numEmptyPages++;
+
+			if (BufferIsValid(buf))
+			{
+				LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+				ReleaseBuffer(buf);
+				buf = InvalidBuffer;
+			}
 		}
 	}
 
@@ -2170,13 +2844,13 @@ brin_stat(PG_FUNCTION_ARGS)
 	brin_free_desc(bdesc);
 	brinRevmapTerminate(revmap);
 
-	sprintf(ptr,
-		"Number of revmap pages:        %d\n"
-		"Number of empty revmap pages:  %d\n"
-		"Number of regular pages:       %d\n"
-		"Number of tuples:              %d\n"
-		"Used space:                    "INT64_FORMAT" bytes\n"
-		"Free space:                    "INT64_FORMAT" bytes\n",
+	snprintf(ptr, 1024 - VARHDRSZ,
+		"Number of revmap pages:        %u\n"
+		"Number of empty revmap pages:  %u\n"
+		"Number of regular pages:       %u\n"
+		"Number of tuples:              %u\n"
+		"Used space:                    "UINT64_FORMAT" bytes\n"
+		"Free space:                    "UINT64_FORMAT" bytes\n",
 		numRevmapPages,
 		numEmptyPages,
 		numRegularPages,
@@ -2188,6 +2862,10 @@ brin_stat(PG_FUNCTION_ARGS)
 	ptr=strchr(ptr,'\0');
 
 	brin_index_close(index);
+	table_close(heapRel, AccessShareLock);
+
+	PG_FREE_IF_COPY(name, 0);
+
 	SET_VARSIZE(out, ptr-((char*)out));
 	PG_RETURN_POINTER(out);
 }
@@ -2211,6 +2889,7 @@ brin_print(PG_FUNCTION_ARGS)
 	BlockNumber pagesPerRange;
 	BrinRevmap *revmap;
 	Relation heapRel;
+	Oid indexOid, heapOid;
 	int len = 1024;
 
 	text *out=(text*)palloc(len);
@@ -2218,32 +2897,36 @@ brin_print(PG_FUNCTION_ARGS)
 
 	relname_list = textToQualifiedNameList(name);
 	relvar = makeRangeVarFromNameList(relname_list);
-	index = brin_index_open(relvar);
+	indexOid = RangeVarGetRelid(relvar, NoLock, false);
+	heapOid = IndexGetRelation(indexOid, true);
+	if (!OidIsValid(heapOid))
+		elog(ERROR, "relation \"%s\" is not an index", relvar->relname);
 
-	heapRel = table_open(IndexGetRelation(RelationGetRelid(index), false),
-						 AccessShareLock);
+	/* Strict lock hierarchy: table first, then index */
+	heapRel = table_open(heapOid, AccessShareLock);
+	index = brin_index_open(indexOid);
 
 	/* Determine range of pages to process */
 	numBlocks = RelationGetNumberOfBlocks(heapRel);
-#if PG_VERSION_NUM >= 140000
-	revmap = brinRevmapInitialize(index, &pagesPerRange);
-#else
-	revmap = brinRevmapInitialize(index, &pagesPerRange, NULL);
-#endif
+	revmap = GEVEL_BRIN_REVMAP_INIT(index, &pagesPerRange);
 
 	for (heapBlk = 0; heapBlk < numBlocks; heapBlk += pagesPerRange)
 	{
 		BlockNumber rangeEndBlk;
 		BlockNumber rangeBlk;
 
+		CHECK_FOR_INTERRUPTS();
+
 		if (heapBlk + pagesPerRange > numBlocks)
 			rangeEndBlk = numBlocks - heapBlk;
 		else
 			rangeEndBlk = pagesPerRange;
 
-		while ((ptr - ((char*)out)) + 128 >= len)
+		while ((ptr - ((char*)out)) + 256 >= len)
 		{
 			int dist = ptr - ((char*)out);
+			if (len > MaxAllocSize / 2)
+				elog(ERROR, "out of memory in brin_print");
 			len *= 2;
 			out = (text*)repalloc(out, len);
 			ptr = ((char*)out) + dist;
@@ -2255,12 +2938,19 @@ brin_print(PG_FUNCTION_ARGS)
 		for (rangeBlk = 0; rangeBlk < rangeEndBlk; rangeBlk++)
 		{
 			Page page;
-			Buffer buf = ReadBuffer(heapRel, heapBlk + rangeBlk);
+			Buffer buf;
+
+			CHECK_FOR_INTERRUPTS();
+
+			buf = ReadBuffer(heapRel, heapBlk + rangeBlk);
+			LockBuffer(buf, BUFFER_LOCK_SHARE);
 			page = BufferGetPage(buf);
 
-			while ((ptr - ((char*)out)) + 128 >= len)
+			while ((ptr - ((char*)out)) + 256 >= len)
 			{
 				int dist = ptr - ((char*)out);
+				if (len > MaxAllocSize / 2)
+					elog(ERROR, "out of memory in brin_print");
 				len *= 2;
 				out = (text*)repalloc(out, len);
 				ptr = ((char*)out) + dist;
@@ -2272,13 +2962,15 @@ brin_print(PG_FUNCTION_ARGS)
 					(int) PageGetFreeSpace(page));
 			ptr = strchr(ptr, '\0');
 
-			ReleaseBuffer(buf);
+			UnlockReleaseBuffer(buf);
 		}
 	}
 
 	brinRevmapTerminate(revmap);
-	table_close(heapRel, AccessShareLock);
 	brin_index_close(index);
+	table_close(heapRel, AccessShareLock);
+
+	PG_FREE_IF_COPY(name, 0);
 
 	SET_VARSIZE(out, ptr - ((char*)out));
 	PG_RETURN_POINTER(out);

@@ -73,8 +73,16 @@ SELECT * FROM gin_stat('idx_test_gin_multi', 0) AS t(val text, nrow int)
 SELECT * FROM gin_stat('idx_test_gin_multi', 1) AS t(val int, nrow int)
   ORDER BY val;
 
+-- GIN posting tree with many occurrences
+CREATE TABLE test_gin_posting (doc tsvector);
+INSERT INTO test_gin_posting SELECT to_tsvector('english', 'common term' || (g % 5)::text) FROM generate_series(1, 1000) g;
+CREATE INDEX idx_test_gin_posting ON test_gin_posting USING gin(doc);
+
+SELECT gin_statpage('idx_test_gin_posting');
+SELECT * FROM gin_stat('idx_test_gin_posting') AS t(val text, nrow int) WHERE val = 'common';
+
 -- ================================================================
--- 4. SP-GiST Index Inspection (2D Points)
+-- 4. SP-GiST Index Inspection (2D Points & Text Radix Tree)
 -- ================================================================
 CREATE TABLE test_spgist (p point);
 INSERT INTO test_spgist VALUES (point(1,1)), (point(2,2));
@@ -84,6 +92,43 @@ SELECT spgist_stat('idx_test_spgist');
 SELECT * FROM spgist_print('idx_test_spgist')
   AS t(tid tid, allthesame bool, node int, level int, tid_pointer tid, prefix point, label int, leaf point)
   ORDER BY tid;
+
+-- SP-GiST text index with prefixes and inner nodes
+CREATE TABLE test_spgist_text (t text);
+INSERT INTO test_spgist_text VALUES ('apple'), ('application'), ('apply'), ('banana');
+CREATE INDEX idx_test_spgist_text ON test_spgist_text USING spgist(t);
+
+SELECT spgist_stat('idx_test_spgist_text');
+SELECT level, allthesame, node, prefix, label, leaf
+  FROM spgist_print('idx_test_spgist_text')
+  AS t(tid tid, allthesame bool, node int, level int, tid_pointer tid, prefix text, label int2, leaf text)
+  ORDER BY level, node, leaf, prefix;
+
+-- SP-GiST polygon index (leaf is box, distinct from indexed type polygon)
+CREATE TABLE test_spgist_poly (poly polygon);
+INSERT INTO test_spgist_poly VALUES ('((0,0),(1,1),(1,0))'::polygon);
+CREATE INDEX idx_test_spgist_poly ON test_spgist_poly USING spgist(poly);
+
+SELECT level, leaf FROM spgist_print('idx_test_spgist_poly')
+  AS t(tid tid, allthesame bool, node int, level int, tid_pointer tid, prefix box, label int, leaf box);
+
+-- SP-GiST range index (polymorphic pseudo-type resolution)
+CREATE TABLE test_spgist_range (r int4range);
+INSERT INTO test_spgist_range VALUES ('[10, 20)'), ('[30, 40)');
+CREATE INDEX idx_test_spgist_range ON test_spgist_range USING spgist(r);
+
+SELECT level, leaf FROM spgist_print('idx_test_spgist_range')
+  AS t(tid tid, allthesame bool, node int, level int, tid_pointer tid, prefix int4range, label int, leaf int4range)
+  ORDER BY leaf;
+
+-- SP-GiST index with NULL values
+CREATE TABLE test_spgist_null (t text);
+INSERT INTO test_spgist_null VALUES ('hello'), (NULL);
+CREATE INDEX idx_test_spgist_null ON test_spgist_null USING spgist(t);
+
+SELECT tid, level, leaf FROM spgist_print('idx_test_spgist_null')
+  AS t(tid tid, allthesame bool, node int, level int, tid_pointer tid, prefix text, label int2, leaf text)
+  ORDER BY level, tid;
 
 -- ================================================================
 -- 5. BRIN Index Inspection
@@ -170,8 +215,24 @@ EXCEPTION WHEN OTHERS THEN
   RAISE NOTICE 'Handled error: %', SQLERRM;
 END $$;
 
+-- Non-tsvector index for gin_count_estimate
+DO $$
+BEGIN
+  PERFORM gin_count_estimate('idx_test_gin_arr', to_tsquery('english', 'postgresql'));
+EXCEPTION WHEN OTHERS THEN
+  RAISE NOTICE 'Handled non-tsvector error: %', SQLERRM;
+END $$;
+
+-- Early termination (LIMIT 1) on SRFs
+SELECT level, valid FROM gist_print('idx_test_gist') AS t(level int, valid bool, b box) LIMIT 1;
+SELECT level, valid FROM btree_print('idx_test_btree') AS t(level int, valid bool, id int, val text) LIMIT 1;
+SELECT val, nrow FROM gin_stat('idx_test_gin_arr') AS t(val int, nrow int) LIMIT 1;
+SELECT tid, level FROM spgist_print('idx_test_spgist')
+  AS t(tid tid, allthesame bool, node int, level int, tid_pointer tid, prefix point, label int, leaf point) LIMIT 1;
+
 -- ================================================================
 -- 8. Teardown
 -- ================================================================
-DROP TABLE test_gist, test_btree, test_btree_inc, test_gin, test_gin_multi, test_spgist, test_brin, test_empty, test_part;
+DROP TABLE test_gist, test_btree, test_btree_inc, test_gin, test_gin_multi, test_gin_posting,
+           test_spgist, test_spgist_text, test_spgist_poly, test_spgist_range, test_spgist_null, test_brin, test_empty, test_part;
 DROP EXTENSION gevel;
